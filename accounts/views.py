@@ -1,0 +1,278 @@
+"""Accounts app views — Register, OTP, Login, Profile."""
+from django.utils import timezone
+from django.db import transaction
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework import status
+from rest_framework_simplejwt.tokens import RefreshToken
+
+from .models import CustomUser, OTPRecord
+from .utils import generate_otp, send_otp_sms
+from .permissions import IsAuthenticatedUserCustom, IsAdminUserCustom
+from django.conf import settings
+
+
+def success_response(data=None, message="Success", http_status=200):
+    return Response({"success": True, "message": message, "data": data or {}}, status=http_status)
+
+
+def error_response(message, error_code="ERROR", http_status=400):
+    return Response({"success": False, "message": message, "error_code": error_code}, status=http_status)
+
+
+def get_tokens_for_user(user):
+    refresh = RefreshToken.for_user(user)
+    return {
+        "refresh": str(refresh),
+        "access": str(refresh.access_token),
+    }
+
+
+class RegisterView(APIView):
+    """Register a new user. Does NOT verify — sends OTP after registration."""
+
+    def post(self, request):
+        phone_number = request.data.get("phone_number", "").strip()
+        password = request.data.get("password", "").strip()
+        first_name = request.data.get("first_name", "").strip()
+        last_name = request.data.get("last_name", "").strip()
+
+        if not all([phone_number, password, first_name, last_name]):
+            return error_response("All fields are required.", "MISSING_FIELDS")
+
+        if len(password) < 6:
+            return error_response("Password must be at least 6 characters.", "WEAK_PASSWORD")
+
+        if CustomUser.objects.filter(phone_number=phone_number).exists():
+            return error_response("Phone number already registered.", "PHONE_EXISTS")
+
+        with transaction.atomic():
+            user = CustomUser.objects.create_user(
+                phone_number=phone_number,
+                password=password,
+                first_name=first_name,
+                last_name=last_name,
+                is_verified=False,
+            )
+            otp_code = generate_otp(settings.OTP_DIGITS)
+            OTPRecord.objects.create(user=user, code=otp_code)
+            send_otp_sms(phone_number, otp_code)
+
+        return success_response(
+            {"phone_number": phone_number},
+            "Registration successful. OTP sent to your phone.",
+            http_status=201,
+        )
+
+
+class SendOTPView(APIView):
+    """Resend OTP to an existing unverified user."""
+
+    def post(self, request):
+        phone_number = request.data.get("phone_number", "").strip()
+        if not phone_number:
+            return error_response("Phone number is required.", "MISSING_PHONE")
+
+        try:
+            user = CustomUser.objects.get(phone_number=phone_number)
+        except CustomUser.DoesNotExist:
+            return error_response("User not found.", "USER_NOT_FOUND", 404)
+
+        if user.is_verified:
+            return error_response("Account already verified.", "ALREADY_VERIFIED")
+
+        # Rate limit: check if recent OTP exists (last 1 min)
+        recent = OTPRecord.objects.filter(
+            user=user, is_used=False,
+            created_at__gte=timezone.now() - timezone.timedelta(minutes=1)
+        ).exists()
+        if recent:
+            return error_response("Please wait before requesting another OTP.", "OTP_RATE_LIMIT", 429)
+
+        otp_code = generate_otp(settings.OTP_DIGITS)
+        OTPRecord.objects.create(user=user, code=otp_code)
+        send_otp_sms(phone_number, otp_code)
+        return success_response(message="OTP sent successfully.")
+
+
+class VerifyOTPView(APIView):
+    """Verify OTP and activate user account."""
+
+    def post(self, request):
+        phone_number = request.data.get("phone_number", "").strip()
+        otp_code = request.data.get("otp", "").strip()
+
+        if not all([phone_number, otp_code]):
+            return error_response("Phone number and OTP are required.", "MISSING_FIELDS")
+
+        try:
+            user = CustomUser.objects.get(phone_number=phone_number)
+        except CustomUser.DoesNotExist:
+            return error_response("User not found.", "USER_NOT_FOUND", 404)
+
+        otp = OTPRecord.objects.filter(
+            user=user, code=otp_code, is_used=False
+        ).order_by('-created_at').first()
+
+        if not otp or not otp.is_valid():
+            return error_response("Invalid or expired OTP.", "INVALID_OTP")
+
+        with transaction.atomic():
+            otp.is_used = True
+            otp.save()
+            user.is_verified = True
+            user.save()
+
+        tokens = get_tokens_for_user(user)
+        return success_response(
+            {**tokens, "phone_number": user.phone_number},
+            "Account verified successfully.",
+        )
+
+
+class LoginView(APIView):
+    """Login with phone + password. User must be verified."""
+
+    def post(self, request):
+        phone_number = request.data.get("phone_number", "").strip()
+        password = request.data.get("password", "").strip()
+
+        if not all([phone_number, password]):
+            return error_response("Phone number and password are required.", "MISSING_FIELDS")
+
+        try:
+            user = CustomUser.objects.get(phone_number=phone_number)
+        except CustomUser.DoesNotExist:
+            return error_response("Invalid credentials.", "INVALID_CREDENTIALS", 401)
+
+        if not user.check_password(password):
+            return error_response("Invalid credentials.", "INVALID_CREDENTIALS", 401)
+
+        if not user.is_verified:
+            return error_response("Account not verified. Please verify via OTP.", "NOT_VERIFIED", 403)
+
+        if not user.is_active:
+            return error_response("Account is deactivated.", "ACCOUNT_INACTIVE", 403)
+
+        tokens = get_tokens_for_user(user)
+        return success_response({
+            **tokens,
+            "user": {
+                "phone_number": user.phone_number,
+                "first_name": user.first_name,
+                "last_name": user.last_name,
+                "loyalty_points": user.loyalty_points,
+                "is_staff": user.is_staff,
+            }
+        }, "Login successful.")
+
+
+class ProfileView(APIView):
+    """Get and update authenticated user profile."""
+    permission_classes = [IsAuthenticatedUserCustom]
+
+    def get(self, request):
+        user = request.user
+        return success_response({
+            "phone_number": user.phone_number,
+            "first_name": user.first_name,
+            "last_name": user.last_name,
+            "loyalty_points": user.loyalty_points,
+            "is_verified": user.is_verified,
+        })
+
+    def patch(self, request):
+        user = request.user
+        user.first_name = request.data.get("first_name", user.first_name)
+        user.last_name = request.data.get("last_name", user.last_name)
+        new_password = request.data.get("new_password", "").strip()
+        if new_password:
+            if len(new_password) < 6:
+                return error_response("Password must be at least 6 characters.", "WEAK_PASSWORD")
+            user.set_password(new_password)
+        user.save()
+        return success_response(message="Profile updated successfully.")
+
+
+class AdminUserListView(APIView):
+    """Admin: list all users."""
+    permission_classes = [IsAdminUserCustom]
+
+    def get(self, request):
+        users = CustomUser.objects.all().order_by('-created_at')
+        data = [
+            {
+                "phone_number": u.phone_number,
+                "first_name": u.first_name,
+                "last_name": u.last_name,
+                "loyalty_points": u.loyalty_points,
+                "is_verified": u.is_verified,
+                "is_staff": u.is_staff,
+                "created_at": u.created_at.isoformat(),
+            }
+            for u in users
+        ]
+        return success_response(data)
+
+
+class SetTransactionPasswordView(APIView):
+    """Set or update transaction password."""
+    permission_classes = [IsAuthenticatedUserCustom]
+
+    def post(self, request):
+        user = request.user
+        password = request.data.get("transaction_password", "").strip()
+        if not password or len(password) < 4:
+            return error_response("Password must be at least 4 characters.", "WEAK_PASSWORD")
+        
+        user.set_transaction_password(password)
+        user.save()
+        return success_response(message="Transaction password set successfully.")
+
+
+class TransferPointsView(APIView):
+    """Transfer loyalty points to another user."""
+    permission_classes = [IsAuthenticatedUserCustom]
+
+    def post(self, request):
+        sender = request.user
+        target_phone = request.data.get("phone_number", "").strip()
+        try:
+            points_to_transfer = float(request.data.get("points", 0))
+        except ValueError:
+            return error_response("Points must be a number.", "INVALID_INPUT")
+            
+        transaction_password = request.data.get("transaction_password", "").strip()
+
+        if not target_phone or points_to_transfer <= 0:
+            return error_response("Valid phone number and points > 0 are required.", "INVALID_INPUT")
+        
+        biometric_verified = request.data.get("biometric_verified", False)
+        if str(biometric_verified).lower() == 'true':
+            biometric_verified = True
+            
+        if not biometric_verified and not sender.check_transaction_password(transaction_password):
+            return error_response("Invalid transaction password or biometric.", "INVALID_PASSWORD", 401)
+
+        if sender.phone_number == target_phone:
+            return error_response("Cannot transfer points to yourself.", "INVALID_TARGET")
+
+        try:
+            receiver = CustomUser.objects.get(phone_number=target_phone)
+        except CustomUser.DoesNotExist:
+            return error_response("Target user not found.", "USER_NOT_FOUND", 404)
+
+        if sender.loyalty_points < points_to_transfer:
+            return error_response("Insufficient loyalty points.", "INSUFFICIENT_POINTS")
+
+        with transaction.atomic():
+            sender.loyalty_points = round(sender.loyalty_points - points_to_transfer, 2)
+            sender.save(update_fields=['loyalty_points'])
+            receiver.loyalty_points = round(receiver.loyalty_points + points_to_transfer, 2)
+            receiver.save(update_fields=['loyalty_points'])
+
+        return success_response({
+            "transferred_points": points_to_transfer,
+            "remaining_points": sender.loyalty_points,
+            "receiver_phone": receiver.phone_number
+        }, message="Points transferred successfully.")
