@@ -11,7 +11,7 @@ from accounts.permissions import IsAuthenticatedUserCustom, IsAdminUserCustom
 
 
 def success_response(data=None, message="Success", http_status=200):
-    return Response({"success": True, "message": message, "data": data or {}}, status=http_status)
+    return Response({"success": True, "message": message, "data": data if data is not None else {}}, status=http_status)
 
 
 def error_response(message, error_code="ERROR", http_status=400):
@@ -33,6 +33,10 @@ class ValidateQRView(APIView):
             return error_response("QR token is required.", "MISSING_QR_TOKEN")
         if user_lat is None or user_lon is None:
             return error_response("Location coordinates are required.", "MISSING_LOCATION")
+
+        # Strip the CAFE_TABLE: prefix that the admin QR encodes
+        if qr_token.upper().startswith("CAFE_TABLE:"):
+            qr_token = qr_token[len("CAFE_TABLE:"):]
 
         try:
             user_lat = float(user_lat)
@@ -143,8 +147,12 @@ class TableDetailView(APIView):
 
 
 class CafeLocationView(APIView):
-    """Admin: get/update café GPS location."""
-    permission_classes = [IsAdminUserCustom]
+    """Admin: update, Any Auth: get café GPS location and details."""
+    
+    def get_permissions(self):
+        if self.request.method == 'GET':
+            return [IsAuthenticatedUserCustom()]
+        return [IsAdminUserCustom()]
 
     def get(self, request):
         loc = CafeLocation.objects.first()
@@ -152,6 +160,8 @@ class CafeLocationView(APIView):
             return error_response("Café location not configured.", "NO_LOCATION", 404)
         return success_response({
             "name": loc.name,
+            "address": loc.address,
+            "phone_number": loc.phone_number,
             "latitude": loc.latitude,
             "longitude": loc.longitude,
             "radius_meters": loc.radius_meters,
@@ -162,11 +172,21 @@ class CafeLocationView(APIView):
         lon = request.data.get("longitude")
         radius = request.data.get("radius_meters", 100.0)
         name = request.data.get("name", "Main Café")
+        address = request.data.get("address", "")
+        phone_number = request.data.get("phone_number", "")
+        
         if lat is None or lon is None:
             return error_response("latitude and longitude are required.", "MISSING_FIELDS")
+            
         loc, _ = CafeLocation.objects.update_or_create(
             pk=1,
-            defaults={"latitude": float(lat), "longitude": float(lon),
-                      "radius_meters": float(radius), "name": name}
+            defaults={
+                "latitude": float(lat), 
+                "longitude": float(lon),
+                "radius_meters": float(radius), 
+                "name": name,
+                "address": address,
+                "phone_number": phone_number
+            }
         )
         return success_response(message="Café location updated.")

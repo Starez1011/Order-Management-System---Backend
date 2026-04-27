@@ -24,3 +24,14 @@ class IsAdminUserCustom(BasePermission):
             and request.user.is_authenticated
             and request.user.is_staff
         )
+
+class IsSuperAdminUserCustom(BasePermission):
+    """Allow only true super users."""
+    message = 'Superadmin access required.'
+
+    def has_permission(self, request, view):
+        return bool(
+            request.user
+            and request.user.is_authenticated
+            and request.user.is_superuser
+        )

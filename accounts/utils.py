@@ -16,30 +16,38 @@ def send_sms_sparrow(phone_number: str, message: str) -> bool:
     """
     Send SMS via Sparrow SMS Nepal.
     Returns True on success, False on failure.
-    In DEBUG mode, just logs the OTP instead.
     """
-    if settings.DEBUG:
-        logger.warning(f"[DEV MODE] SMS to {phone_number}: {message}")
-        print(f"\n📱 [OTP SMS] To: {phone_number} | Message: {message}\n")
-        return True
+    # =========================================================================
+    # DEVELOPMENT MODE: print OTP to console instead of sending SMS
+    # =========================================================================
+    print("\n" + "=" * 50)
+    print("DEVELOPMENT MODE - OTP NOT SENT VIA SMS")
+    print(f"To: {phone_number}")
+    print(f"Message: {message}")
+    print("=" * 50 + "\n")
+    
+    return True
 
-    try:
-        url = "http://api.sparrowsms.com/v2/sms/"
-        payload = {
-            'token': settings.SPARROW_SMS_TOKEN,
-            'from': settings.SPARROW_SMS_FROM,
-            'to': phone_number,
-            'text': message,
-        }
-        response = requests.post(url, data=payload, timeout=10)
-        data = response.json()
-        if data.get('response_code') == 200:
-            return True
-        logger.error(f"Sparrow SMS error: {data}")
-        return False
-    except Exception as e:
-        logger.error(f"SMS send exception: {e}")
-        return False
+    # =========================================================================
+    # FUTURE SMS IMPLEMENTATION (UNCOMMENT AND UPDATE WHEN READY)
+    # =========================================================================
+    # try:
+    #     url = "http://api.sparrowsms.com/v2/sms/"
+    #     payload = {
+    #         'token': settings.SPARROW_SMS_TOKEN,
+    #         'from': settings.SPARROW_SMS_FROM,
+    #         'to': phone_number,
+    #         'text': message,
+    #     }
+    #     response = requests.post(url, data=payload, timeout=10)
+    #     data = response.json()
+    #     if data.get('response_code') == 200:
+    #         return True
+    #     logger.error(f"Sparrow SMS error: {data}")
+    #     return False
+    # except Exception as e:
+    #     logger.error(f"SMS send exception: {e}")
+    #     return False
 
 
 def send_otp_sms(phone_number: str, otp_code: str) -> bool:

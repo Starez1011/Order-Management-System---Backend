@@ -7,6 +7,8 @@ from django.conf import settings
 class CafeLocation(models.Model):
     """Single record storing the café's GPS location and valid radius."""
     name = models.CharField(max_length=100, default="Main Café")
+    address = models.CharField(max_length=255, blank=True, default="")
+    phone_number = models.CharField(max_length=20, blank=True, default="")
     latitude = models.FloatField()
     longitude = models.FloatField()
     radius_meters = models.FloatField(default=100.0)

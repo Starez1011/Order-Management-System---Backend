@@ -8,12 +8,12 @@ from rest_framework_simplejwt.tokens import RefreshToken
 
 from .models import CustomUser, OTPRecord
 from .utils import generate_otp, send_otp_sms
-from .permissions import IsAuthenticatedUserCustom, IsAdminUserCustom
+from .permissions import IsAuthenticatedUserCustom, IsAdminUserCustom, IsSuperAdminUserCustom
 from django.conf import settings
 
 
 def success_response(data=None, message="Success", http_status=200):
-    return Response({"success": True, "message": message, "data": data or {}}, status=http_status)
+    return Response({"success": True, "message": message, "data": data if data is not None else {}}, status=http_status)
 
 
 def error_response(message, error_code="ERROR", http_status=400):
@@ -28,8 +28,50 @@ def get_tokens_for_user(user):
     }
 
 
-class RegisterView(APIView):
-    """Register a new user. Does NOT verify — sends OTP after registration."""
+from django.utils.crypto import get_random_string
+
+class CheckPhoneView(APIView):
+    """Check if phone number exists. If not, generate unverified user and send OTP."""
+
+    def post(self, request):
+        phone_number = request.data.get("phone_number", "").strip()
+        if not phone_number:
+            return error_response("Phone number is required.", "MISSING_PHONE")
+
+        try:
+            user = CustomUser.objects.get(phone_number=phone_number)
+            if user.is_verified:
+                return success_response({"exists": True}, "User exists and verified.")
+            else:
+                recent = OTPRecord.objects.filter(
+                    user=user, is_used=False,
+                    created_at__gte=timezone.now() - timezone.timedelta(minutes=1)
+                ).exists()
+                if recent:
+                    return error_response("Please wait before requesting another OTP.", "OTP_RATE_LIMIT", 429)
+
+                otp_code = generate_otp(settings.OTP_DIGITS)
+                OTPRecord.objects.create(user=user, code=otp_code)
+                send_otp_sms(phone_number, otp_code)
+                return success_response({"exists": False}, "User unverified, OTP sent.")
+                
+        except CustomUser.DoesNotExist:
+            with transaction.atomic():
+                user = CustomUser.objects.create_user(
+                    phone_number=phone_number,
+                    password=get_random_string(10),
+                    first_name="",
+                    last_name="",
+                    is_verified=False,
+                )
+                otp_code = generate_otp(settings.OTP_DIGITS)
+                OTPRecord.objects.create(user=user, code=otp_code)
+                send_otp_sms(phone_number, otp_code)
+            return success_response({"exists": False}, "New user created, OTP sent.")
+
+
+class RegisterFinalizeView(APIView):
+    """Finalize registration by setting password and names after OTP is verified."""
 
     def post(self, request):
         phone_number = request.data.get("phone_number", "").strip()
@@ -43,25 +85,24 @@ class RegisterView(APIView):
         if len(password) < 6:
             return error_response("Password must be at least 6 characters.", "WEAK_PASSWORD")
 
-        if CustomUser.objects.filter(phone_number=phone_number).exists():
-            return error_response("Phone number already registered.", "PHONE_EXISTS")
+        try:
+            user = CustomUser.objects.get(phone_number=phone_number)
+        except CustomUser.DoesNotExist:
+            return error_response("User not found.", "USER_NOT_FOUND", 404)
 
-        with transaction.atomic():
-            user = CustomUser.objects.create_user(
-                phone_number=phone_number,
-                password=password,
-                first_name=first_name,
-                last_name=last_name,
-                is_verified=False,
-            )
-            otp_code = generate_otp(settings.OTP_DIGITS)
-            OTPRecord.objects.create(user=user, code=otp_code)
-            send_otp_sms(phone_number, otp_code)
+        if not user.is_verified:
+            return error_response("Phone number not verified. Please verify OTP first.", "NOT_VERIFIED", 403)
 
+        user.first_name = first_name
+        user.last_name = last_name
+        user.set_password(password)
+        user.save()
+
+        tokens = get_tokens_for_user(user)
         return success_response(
-            {"phone_number": phone_number},
-            "Registration successful. OTP sent to your phone.",
-            http_status=201,
+            {**tokens, "phone_number": user.phone_number},
+            "Registration finalized successfully.",
+            http_status=201
         )
 
 
@@ -163,6 +204,7 @@ class LoginView(APIView):
                 "last_name": user.last_name,
                 "loyalty_points": user.loyalty_points,
                 "is_staff": user.is_staff,
+                "is_superuser": user.is_superuser,
             }
         }, "Login successful.")
 
@@ -179,6 +221,7 @@ class ProfileView(APIView):
             "last_name": user.last_name,
             "loyalty_points": user.loyalty_points,
             "is_verified": user.is_verified,
+            "is_superuser": user.is_superuser,
         })
 
     def patch(self, request):
@@ -213,6 +256,66 @@ class AdminUserListView(APIView):
             for u in users
         ]
         return success_response(data)
+
+
+class SuperAdminStaffManagementView(APIView):
+    """Superadmin: manage POS Admin accounts (is_staff=True)."""
+    permission_classes = [IsSuperAdminUserCustom]
+
+    def get(self, request):
+        """List all admins."""
+        staff = CustomUser.objects.filter(is_staff=True).order_by('-created_at')
+        return success_response([{
+            "id": u.id,
+            "phone_number": u.phone_number,
+            "first_name": u.first_name,
+            "last_name": u.last_name,
+            "is_active": u.is_active,
+            "is_superuser": u.is_superuser,
+            "created_at": u.created_at.isoformat(),
+        } for u in staff])
+    
+    def post(self, request):
+        """Create a new POS Admin."""
+        phone_number = request.data.get("phone_number", "").strip()
+        first_name = request.data.get("first_name", "").strip()
+        last_name = request.data.get("last_name", "").strip()
+        password = request.data.get("password", "").strip()
+
+        if not all([phone_number, first_name, last_name, password]):
+            return error_response("All fields are required.", "MISSING_FIELDS")
+        
+        if CustomUser.objects.filter(phone_number=phone_number).exists():
+            return error_response("Phone number already exists.", "PHONE_EXISTS")
+
+        try:
+            with transaction.atomic():
+                user = CustomUser.objects.create_user(
+                    phone_number=phone_number,
+                    password=password,
+                    first_name=first_name,
+                    last_name=last_name,
+                    is_verified=True,
+                )
+                user.is_staff = True
+                user.save()
+            return success_response({"id": user.id, "phone_number": phone_number}, "Admin account created.", 201)
+        except Exception as e:
+            return error_response(str(e), "CREATE_ERROR")
+
+    def patch(self, request, user_id):
+        """Toggle an admin's access (deactivate/activate)."""
+        if request.user.id == user_id:
+            return error_response("Cannot deactivate your own superadmin account.", "SELF_ACTION")
+            
+        try:
+            target = CustomUser.objects.get(id=user_id, is_staff=True)
+            target.is_active = not target.is_active
+            target.save()
+            status_text = "activated" if target.is_active else "deactivated"
+            return success_response({"is_active": target.is_active}, f"Admin {status_text} successfully.")
+        except CustomUser.DoesNotExist:
+            return error_response("Admin user not found.", "NOT_FOUND", 404)
 
 
 class SetTransactionPasswordView(APIView):

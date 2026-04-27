@@ -15,7 +15,7 @@ from accounts.permissions import IsAuthenticatedUserCustom, IsAdminUserCustom
 
 
 def success_response(data=None, message="Success", http_status=200):
-    return Response({"success": True, "message": message, "data": data or {}}, status=http_status)
+    return Response({"success": True, "message": message, "data": data if data is not None else {}}, status=http_status)
 
 
 def error_response(message, error_code="ERROR", http_status=400):
@@ -23,12 +23,18 @@ def error_response(message, error_code="ERROR", http_status=400):
 
 
 def broadcast_order_update(table_number):
-    """Push live update to admin WebSocket group for this table."""
+    """Push live update to per-table WebSocket group AND the global dashboard group."""
     try:
         channel_layer = get_channel_layer()
+        # Notify the per-table listener (TableDetail page)
         async_to_sync(channel_layer.group_send)(
             f"table_{table_number}",
             {"type": "order_update", "table_number": table_number}
+        )
+        # Notify the global dashboard listener (Dashboard page)
+        async_to_sync(channel_layer.group_send)(
+            "dashboard",
+            {"type": "dashboard_update", "table_number": table_number}
         )
     except Exception:
         pass

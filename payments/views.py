@@ -17,7 +17,7 @@ from accounts.permissions import IsAuthenticatedUserCustom, IsAdminUserCustom
 
 
 def success_response(data=None, message="Success", http_status=200):
-    return Response({"success": True, "message": message, "data": data or {}}, status=http_status)
+    return Response({"success": True, "message": message, "data": data if data is not None else {}}, status=http_status)
 
 
 def error_response(message, error_code="ERROR", http_status=400):
