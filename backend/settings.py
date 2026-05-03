@@ -16,6 +16,7 @@ ALLOWED_HOSTS = ['*']
 
 # Application definition
 INSTALLED_APPS = [
+    'daphne',
     'django.contrib.admin',
     'django.contrib.auth',
     'django.contrib.contenttypes',
@@ -104,6 +105,11 @@ SIMPLE_JWT = {
 
 # CORS
 CORS_ALLOW_ALL_ORIGINS = True
+
+from corsheaders.defaults import default_headers
+CORS_ALLOW_HEADERS = list(default_headers) + [
+    'ngrok-skip-browser-warning',
+]
 
 # Password validation
 AUTH_PASSWORD_VALIDATORS = [

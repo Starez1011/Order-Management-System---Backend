@@ -31,9 +31,10 @@ class Cart(models.Model):
 
 class Order(models.Model):
     STATUS_CHOICES = [
-        ('pending', 'Pending'),
-        ('preparing', 'Preparing'),
-        ('served', 'Served'),
+        ('order_sent', 'Order Sent'),
+        ('order_received', 'Order Received'),
+        ('order_served', 'Order Served'),
+        ('cancelled', 'Cancelled'),
         ('paid', 'Paid'),
         ('paid_by_points', 'Paid by Points'),
     ]
@@ -54,7 +55,7 @@ class Order(models.Model):
     user = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='orders'
     )
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='order_sent')
     payment_status = models.CharField(max_length=20, choices=PAYMENT_STATUS_CHOICES, default='pending')
     payment_method = models.CharField(max_length=20, choices=PAYMENT_METHOD_CHOICES, null=True, blank=True)
     total_amount = models.FloatField(default=0.0)

@@ -16,4 +16,5 @@ urlpatterns = [
     path('transfer-points/', views.TransferPointsView.as_view(), name='transfer-points'),
     path('superadmin/staff/', views.SuperAdminStaffManagementView.as_view(), name='superadmin-staff'),
     path('superadmin/staff/<int:user_id>/', views.SuperAdminStaffManagementView.as_view(), name='superadmin-staff-detail'),
+    path('notifications/', views.NotificationListView.as_view(), name='notifications'),
 ]

@@ -176,6 +176,8 @@ class AdminMenuItemDetailView(APIView):
 
         if request.FILES.get("image"):
             item.image = request.FILES.get("image")
+        elif str(request.data.get("remove_image", "")).lower() == "true":
+            item.image = None
 
         item.save()
         return success_response(serialize_item(item, request), "Item updated.")

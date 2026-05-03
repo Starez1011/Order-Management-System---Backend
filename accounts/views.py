@@ -6,7 +6,7 @@ from rest_framework.response import Response
 from rest_framework import status
 from rest_framework_simplejwt.tokens import RefreshToken
 
-from .models import CustomUser, OTPRecord
+from .models import CustomUser, OTPRecord, Notification
 from .utils import generate_otp, send_otp_sms
 from .permissions import IsAuthenticatedUserCustom, IsAdminUserCustom, IsSuperAdminUserCustom
 from django.conf import settings
@@ -373,9 +373,44 @@ class TransferPointsView(APIView):
             sender.save(update_fields=['loyalty_points'])
             receiver.loyalty_points = round(receiver.loyalty_points + points_to_transfer, 2)
             receiver.save(update_fields=['loyalty_points'])
+            
+            # Create notifications
+            Notification.objects.create(
+                user=sender,
+                title="Points Sent",
+                message=f"You successfully sent {points_to_transfer} points to {receiver.first_name} ({target_phone})."
+            )
+            Notification.objects.create(
+                user=receiver,
+                title="Points Received",
+                message=f"You received {points_to_transfer} points from {sender.first_name} ({sender.phone_number})."
+            )
 
         return success_response({
             "transferred_points": points_to_transfer,
             "remaining_points": sender.loyalty_points,
             "receiver_phone": receiver.phone_number
         }, message="Points transferred successfully.")
+
+class NotificationListView(APIView):
+    """Customer: get notifications and mark all as read."""
+    permission_classes = [IsAuthenticatedUserCustom]
+
+    def get(self, request):
+        notifications = Notification.objects.filter(user=request.user).order_by('-created_at')[:50]
+        data = [
+            {
+                "id": n.id,
+                "title": n.title,
+                "message": n.message,
+                "is_read": n.is_read,
+                "created_at": n.created_at.isoformat(),
+            }
+            for n in notifications
+        ]
+        return success_response(data)
+
+    def post(self, request):
+        """Mark all notifications as read."""
+        Notification.objects.filter(user=request.user, is_read=False).update(is_read=True)
+        return success_response(message="Notifications marked as read.")
