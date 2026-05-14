@@ -6,13 +6,13 @@ from rest_framework.response import Response
 from django.db.models import Sum
 from django.db.models.functions import TruncDay, TruncMonth, TruncYear
 
-from .models import SystemConfig
+from admin_panel.models import SystemConfig, Banner, Offer
 from orders.models import Order, OrderItem
 from tables.models import Table, TableSession
 from payments.models import Payment
 from menu.models import MenuItem
 from accounts.models import CustomUser
-from accounts.permissions import IsAdminUserCustom
+from accounts.permissions import IsAdminUserCustom, IsSuperAdminUserCustom, get_target_admin
 from orders.views import broadcast_order_update
 
 
@@ -37,6 +37,8 @@ class SystemConfigView(APIView):
         })
 
     def patch(self, request):
+        if not request.user.is_superuser:
+            return error_response("Only superadmins can update system config.", "FORBIDDEN", 403)
         config, _ = SystemConfig.objects.get_or_create(pk=1)
 
         loyalty_pct = request.data.get("loyalty_percentage")
@@ -72,7 +74,8 @@ class DashboardView(APIView):
     permission_classes = [IsAdminUserCustom]
 
     def get(self, request):
-        tables = Table.objects.prefetch_related('sessions', 'orders').filter(is_active=True)
+        target_admin = get_target_admin(request)
+        tables = Table.objects.filter(admin=target_admin, is_active=True).prefetch_related('sessions', 'orders')
         today = timezone.now().date()
 
         table_data = []
@@ -100,9 +103,9 @@ class DashboardView(APIView):
             })
 
         # Today's revenue
-        today_payments = Payment.objects.filter(created_at__date=today)
+        today_payments = Payment.objects.filter(admin=target_admin, created_at__date=today)
         today_revenue = sum(p.cash_paid for p in today_payments)
-        today_orders = Order.objects.filter(created_at__date=today).exclude(status='cancelled').count()
+        today_orders = Order.objects.filter(admin=target_admin, created_at__date=today).exclude(status='cancelled').count()
 
         return success_response({
             "tables": table_data,
@@ -116,11 +119,12 @@ class RevenueAnalyticsView(APIView):
     permission_classes = [IsAdminUserCustom]
 
     def get(self, request):
+        target_admin = get_target_admin(request)
         # We look at all payments, grouped by different time truncations
         
         # Daywise (last 30 days)
         thirty_days_ago = timezone.now() - timezone.timedelta(days=30)
-        daywise = Payment.objects.filter(created_at__gte=thirty_days_ago) \
+        daywise = Payment.objects.filter(admin=target_admin, created_at__gte=thirty_days_ago) \
             .annotate(date=TruncDay('created_at')) \
             .values('date') \
             .annotate(revenue=Sum('cash_paid')) \
@@ -128,14 +132,14 @@ class RevenueAnalyticsView(APIView):
             
         # Monthwise (last 12 months)
         twelve_months_ago = timezone.now() - timezone.timedelta(days=365)
-        monthwise = Payment.objects.filter(created_at__gte=twelve_months_ago) \
+        monthwise = Payment.objects.filter(admin=target_admin, created_at__gte=twelve_months_ago) \
             .annotate(month=TruncMonth('created_at')) \
             .values('month') \
             .annotate(revenue=Sum('cash_paid')) \
             .order_by('-month')
             
         # Yearwise (all time)
-        yearwise = Payment.objects.annotate(year=TruncYear('created_at')) \
+        yearwise = Payment.objects.filter(admin=target_admin).annotate(year=TruncYear('created_at')) \
             .values('year') \
             .annotate(revenue=Sum('cash_paid')) \
             .order_by('-year')
@@ -161,8 +165,9 @@ class ClearTableView(APIView):
     permission_classes = [IsAdminUserCustom]
 
     def post(self, request, table_number):
+        target_admin = get_target_admin(request)
         try:
-            table = Table.objects.get(table_number=table_number)
+            table = Table.objects.get(admin=target_admin, table_number=table_number)
         except Table.DoesNotExist:
             return error_response("Table not found.", "TABLE_NOT_FOUND", 404)
 
@@ -187,7 +192,7 @@ class ClearTableView(APIView):
 
         # Broadcast update so UI refreshes
         from orders.views import broadcast_order_update
-        broadcast_order_update(table.table_number)
+        broadcast_order_update(table)
 
         return success_response({"table_number": table_number}, "Table cleared successfully.")
 
@@ -197,17 +202,18 @@ class TransferTableView(APIView):
     permission_classes = [IsAdminUserCustom]
 
     def post(self, request, table_number):
+        target_admin = get_target_admin(request)
         to_table_number = request.data.get("to_table")
         if not to_table_number:
             return error_response("Destination table (to_table) is required.", "MISSING_DESTINATION")
             
         try:
-            from_table = Table.objects.get(table_number=table_number)
+            from_table = Table.objects.get(admin=target_admin, table_number=table_number)
         except Table.DoesNotExist:
             return error_response("Source table not found.", "TABLE_NOT_FOUND", 404)
             
         try:
-            to_table = Table.objects.get(table_number=to_table_number)
+            to_table = Table.objects.get(admin=target_admin, table_number=to_table_number)
         except Table.DoesNotExist:
             return error_response("Destination table not found.", "TABLE_NOT_FOUND", 404)
 
@@ -248,8 +254,8 @@ class TransferTableView(APIView):
 
         # Broadcast update for both tables
         from orders.views import broadcast_order_update
-        broadcast_order_update(from_table.table_number)
-        broadcast_order_update(to_table.table_number)
+        broadcast_order_update(from_table)
+        broadcast_order_update(to_table)
 
         return success_response({
             "from_table": from_table.table_number,
@@ -263,7 +269,8 @@ class AdminOrderHistoryView(APIView):
     permission_classes = [IsAdminUserCustom]
 
     def get(self, request):
-        qs = Order.objects.select_related('table', 'user').prefetch_related('items__item')
+        target_admin = get_target_admin(request)
+        qs = Order.objects.filter(admin=target_admin).select_related('table', 'user').prefetch_related('items__item')
 
         # Filters
         table_number = request.GET.get("table_number")
@@ -289,7 +296,8 @@ class AdminOrderHistoryView(APIView):
                 "phone_number": o.user.phone_number,
                 "status": o.status,
                 "payment_status": o.payment_status,
-                "payment_method": o.payment_method,
+                "payment_method": o.get_payment_method_display() if o.payment_method else None,
+                "branch_name": o.admin.cafelocation.branch_name if hasattr(o.admin, 'cafelocation') else 'Unknown',
                 "total_amount": o.total_amount,
                 "created_at": o.created_at.isoformat(),
                 "items": [
@@ -330,6 +338,7 @@ class AdminOrderCreateView(APIView):
 
         # Create order
         order = Order.objects.create(
+            admin=request.user,
             table=table,
             user=user,
             status='order_sent',
@@ -365,7 +374,7 @@ class AdminOrderCreateView(APIView):
         # Activate table session if not active
         session, _ = TableSession.objects.get_or_create(table=table, is_active=True)
 
-        broadcast_order_update(table.table_number)
+        broadcast_order_update(table)
         return success_response({"order_number": order.order_number, "total_amount": order.total_amount}, "Order created.", 201)
 
 
@@ -376,7 +385,7 @@ class AdminOrderEditView(APIView):
     @transaction.atomic
     def patch(self, request, order_number):
         try:
-            order = Order.objects.get(order_number=order_number)
+            order = Order.objects.get(order_number=order_number, admin=request.user)
         except Order.DoesNotExist:
             return error_response("Order not found.", "ORDER_NOT_FOUND", 404)
 
@@ -419,5 +428,228 @@ class AdminOrderEditView(APIView):
             order.total_amount = total
             order.save()
 
-        broadcast_order_update(order.table.table_number)
+        broadcast_order_update(order.table)
         return success_response({"order_number": order.order_number, "total_amount": order.total_amount}, "Order updated.")
+
+from accounts.models import CustomUser
+
+class UserByPhoneView(APIView):
+    """Admin checks if a user exists by phone and gets name."""
+    permission_classes = [IsAdminUserCustom]
+
+    def get(self, request, phone_number):
+        try:
+            user = CustomUser.objects.get(phone_number=phone_number)
+            # Differentiate a registered user from an auto-created walk-in
+            if not user.is_verified and user.first_name == 'Walk-in':
+                return error_response("User not found.", "NOT_FOUND", 404)
+            
+            return success_response({
+                "first_name": user.first_name,
+                "last_name": user.last_name,
+                "loyalty_points": user.loyalty_points
+            })
+        except CustomUser.DoesNotExist:
+            return error_response("User not found.", "NOT_FOUND", 404)
+
+
+# ─── Promotions: Banners ────────────────────────────────────────────────────
+
+class BannerListView(APIView):
+    """Public GET (branch_id param), superadmin POST."""
+
+    def get(self, request):
+        qs = Banner.objects.filter(is_active=True)
+        data = []
+        for b in qs:
+            img = None
+            if b.image:
+                img = b.image.url
+            elif b.image_url:
+                img = b.image_url
+            data.append({
+                "id": b.id,
+                "title": b.title,
+                "subtitle": b.subtitle,
+                "image_url": img,
+                "display_order": b.display_order,
+            })
+        return success_response(data)
+
+    def post(self, request):
+        if not request.user.is_authenticated or not request.user.is_superuser:
+            return error_response("Superadmin access required.", "FORBIDDEN", 403)
+        title = request.data.get("title", "").strip()
+        if not title:
+            return error_response("title is required.")
+        banner = Banner.objects.create(
+            title=title,
+            subtitle=request.data.get("subtitle", ""),
+            image_url=request.data.get("image_url", ""),
+            display_order=int(request.data.get("display_order", 0)),
+            is_active=bool(request.data.get("is_active", True)),
+            image=request.FILES.get("image"),
+        )
+        return success_response({"id": banner.id}, "Banner created.", 201)
+
+
+class BannerDetailView(APIView):
+    """Superadmin PATCH / DELETE a single banner."""
+
+    def _get_banner(self, pk):
+        try:
+            return Banner.objects.get(pk=pk)
+        except Banner.DoesNotExist:
+            return None
+
+    def patch(self, request, banner_id):
+        if not request.user.is_authenticated or not request.user.is_superuser:
+            return error_response("Superadmin access required.", "FORBIDDEN", 403)
+        banner = self._get_banner(banner_id)
+        if not banner:
+            return error_response("Banner not found.", "NOT_FOUND", 404)
+        banner.title = request.data.get("title", banner.title)
+        banner.subtitle = request.data.get("subtitle", banner.subtitle)
+        banner.image_url = request.data.get("image_url", banner.image_url)
+        banner.display_order = int(request.data.get("display_order", banner.display_order))
+        banner.is_active = request.data.get("is_active", banner.is_active)
+        if request.FILES.get("image"):
+            banner.image = request.FILES["image"]
+        banner.save()
+        return success_response(message="Banner updated.")
+
+    def delete(self, request, banner_id):
+        if not request.user.is_authenticated or not request.user.is_superuser:
+            return error_response("Superadmin access required.", "FORBIDDEN", 403)
+        banner = self._get_banner(banner_id)
+        if not banner:
+            return error_response("Banner not found.", "NOT_FOUND", 404)
+        banner.delete()
+        return success_response(message="Banner deleted.")
+
+
+# ─── Promotions: Offers ─────────────────────────────────────────────────────
+
+class OfferListView(APIView):
+    """Public GET, superadmin POST."""
+
+    def get(self, request):
+        qs = Offer.objects.filter(is_active=True)
+        data = []
+        for o in qs:
+            img = None
+            if o.image:
+                img = o.image.url
+            data.append({
+                "id": o.id,
+                "title": o.title,
+                "description": o.description,
+                "discount_text": o.discount_text,
+                "image_url": img,
+                "valid_until": o.valid_until.isoformat() if o.valid_until else None,
+                "display_order": o.display_order,
+            })
+        return success_response(data)
+
+    def post(self, request):
+        if not request.user.is_authenticated or not request.user.is_superuser:
+            return error_response("Superadmin access required.", "FORBIDDEN", 403)
+        title = request.data.get("title", "").strip()
+        discount_text = request.data.get("discount_text", "").strip()
+        if not title or not discount_text:
+            return error_response("title and discount_text are required.")
+        valid_until = request.data.get("valid_until") or None
+        offer = Offer.objects.create(
+            title=title,
+            description=request.data.get("description", ""),
+            discount_text=discount_text,
+            display_order=int(request.data.get("display_order", 0)),
+            is_active=bool(request.data.get("is_active", True)),
+            valid_until=valid_until,
+            image=request.FILES.get("image"),
+        )
+        return success_response({"id": offer.id}, "Offer created.", 201)
+
+
+class OfferDetailView(APIView):
+    """Superadmin PATCH / DELETE a single offer."""
+
+    def _get_offer(self, pk):
+        try:
+            return Offer.objects.get(pk=pk)
+        except Offer.DoesNotExist:
+            return None
+
+    def patch(self, request, offer_id):
+        if not request.user.is_authenticated or not request.user.is_superuser:
+            return error_response("Superadmin access required.", "FORBIDDEN", 403)
+        offer = self._get_offer(offer_id)
+        if not offer:
+            return error_response("Offer not found.", "NOT_FOUND", 404)
+        offer.title = request.data.get("title", offer.title)
+        offer.description = request.data.get("description", offer.description)
+        offer.discount_text = request.data.get("discount_text", offer.discount_text)
+        offer.display_order = int(request.data.get("display_order", offer.display_order))
+        offer.is_active = request.data.get("is_active", offer.is_active)
+        valid_until = request.data.get("valid_until")
+        if valid_until is not None:
+            offer.valid_until = valid_until or None
+        if request.FILES.get("image"):
+            offer.image = request.FILES["image"]
+        offer.save()
+        return success_response(message="Offer updated.")
+
+    def delete(self, request, offer_id):
+        if not request.user.is_authenticated or not request.user.is_superuser:
+            return error_response("Superadmin access required.", "FORBIDDEN", 403)
+        offer = self._get_offer(offer_id)
+        if not offer:
+            return error_response("Offer not found.", "NOT_FOUND", 404)
+        offer.delete()
+        return success_response(message="Offer deleted.")
+
+
+# ─── Promotions: Popular Items ───────────────────────────────────────────────
+
+class PopularItemsView(APIView):
+    """Public: top 8 most-ordered items, optionally filtered by branch."""
+
+    def get(self, request):
+        from django.db.models import Count
+        from tables.models import CafeLocation
+
+        branch_id = request.GET.get('branch_id')
+
+        qs = OrderItem.objects.all()
+
+        if branch_id:
+            # Filter to orders placed at tables belonging to this branch's admin
+            try:
+                branch = CafeLocation.objects.get(pk=branch_id)
+                qs = qs.filter(order__admin=branch.admin)
+            except CafeLocation.DoesNotExist:
+                pass  # fall back to global popular items
+
+        top_items = (
+            qs
+            .values('item__id', 'item__name', 'item__price', 'item__image')
+            .annotate(total_ordered=Count('id'))
+            .order_by('-total_ordered')[:8]
+        )
+        data = []
+        for row in top_items:
+            img = None
+            if row['item__image']:
+                try:
+                    item_obj = MenuItem.objects.get(pk=row['item__id'])
+                    img = item_obj.image.url if item_obj.image else None
+                except Exception:
+                    pass
+            data.append({
+                "id": row['item__id'],
+                "name": row['item__name'],
+                "price": str(row['item__price']),
+                "image_url": img,
+                "total_ordered": row['total_ordered'],
+            })
+        return success_response(data)

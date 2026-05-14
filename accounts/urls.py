@@ -1,7 +1,7 @@
 """Accounts app URL patterns."""
 from django.urls import path
 from rest_framework_simplejwt.views import TokenRefreshView
-from . import views
+from accounts import views
 
 urlpatterns = [
     path('check-phone/', views.CheckPhoneView.as_view(), name='check_phone'),

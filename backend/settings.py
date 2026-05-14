@@ -14,6 +14,10 @@ DEBUG = True
 
 ALLOWED_HOSTS = ['*']
 
+# Ensure absolute URIs built by Django use the correct host and protocol when behind a proxy (like ngrok)
+SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+USE_X_FORWARDED_HOST = True
+
 # Application definition
 INSTALLED_APPS = [
     'daphne',
@@ -109,6 +113,7 @@ CORS_ALLOW_ALL_ORIGINS = True
 from corsheaders.defaults import default_headers
 CORS_ALLOW_HEADERS = list(default_headers) + [
     'ngrok-skip-browser-warning',
+    'x-target-admin-id',
 ]
 
 # Password validation

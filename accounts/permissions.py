@@ -35,3 +35,21 @@ class IsSuperAdminUserCustom(BasePermission):
             and request.user.is_authenticated
             and request.user.is_superuser
         )
+
+def get_target_admin(request):
+    """
+    Returns the target admin context for the current request.
+    If the user is a superadmin and an X-Target-Admin-ID header is provided,
+    this attempts to return that specific admin user.
+    Otherwise, returns the current authenticated user.
+    """
+    user = request.user
+    if user.is_superuser:
+        target_id = request.headers.get('X-Target-Admin-ID')
+        if target_id:
+            try:
+                from accounts.models import CustomUser
+                return CustomUser.objects.get(id=target_id, is_staff=True)
+            except Exception:
+                pass
+    return user

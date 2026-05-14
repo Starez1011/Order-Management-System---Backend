@@ -23,20 +23,43 @@ class OrderUpdateConsumer(AsyncWebsocketConsumer):
         }))
 
 
+import urllib.parse
+
 class DashboardConsumer(AsyncWebsocketConsumer):
     """
-    Global consumer for the admin dashboard.
-    Joins the single 'dashboard' group and receives a message whenever
-    any table's order state changes — so the dashboard can re-fetch.
+    Branch-specific consumer for the admin dashboard.
+    Joins the 'dashboard_{admin_id}' group and receives a message whenever
+    any table in that branch changes state.
     """
 
     async def connect(self):
-        self.group_name = "dashboard"
+        import jwt
+        from django.conf import settings
+        
+        query_string = self.scope['query_string'].decode()
+        query_params = urllib.parse.parse_qs(query_string)
+        
+        target_admin_id = query_params.get('target_admin_id', [None])[0]
+        token = query_params.get('token', [None])[0]
+        
+        if not target_admin_id and token:
+            try:
+                payload = jwt.decode(token, settings.SECRET_KEY, algorithms=['HS256'])
+                target_admin_id = payload.get('user_id')
+            except Exception:
+                pass
+        
+        if target_admin_id:
+            self.group_name = f"dashboard_{target_admin_id}"
+        else:
+            self.group_name = "dashboard_global"
+            
         await self.channel_layer.group_add(self.group_name, self.channel_name)
         await self.accept()
 
     async def disconnect(self, close_code):
-        await self.channel_layer.group_discard(self.group_name, self.channel_name)
+        if hasattr(self, 'group_name'):
+            await self.channel_layer.group_discard(self.group_name, self.channel_name)
 
     async def dashboard_update(self, event):
         """Forward dashboard_update events to the connected WebSocket client."""

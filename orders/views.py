@@ -9,7 +9,7 @@ from rest_framework import status
 from channels.layers import get_channel_layer
 from asgiref.sync import async_to_sync
 
-from .models import Cart, Order, OrderItem
+from orders.models import Cart, Order, OrderItem
 from tables.models import Table, TableSession
 from menu.models import MenuItem
 from accounts.permissions import IsAuthenticatedUserCustom, IsAdminUserCustom
@@ -23,19 +23,20 @@ def error_response(message, error_code="ERROR", http_status=400):
     return Response({"success": False, "message": message, "error_code": error_code}, status=http_status)
 
 
-def broadcast_order_update(table_number):
-    """Push live update to per-table WebSocket group AND the global dashboard group."""
+def broadcast_order_update(table):
+    """Push live update to per-table WebSocket group AND the branch dashboard group."""
     try:
         channel_layer = get_channel_layer()
         # Notify the per-table listener (TableDetail page)
         async_to_sync(channel_layer.group_send)(
-            f"table_{table_number}",
-            {"type": "order_update", "table_number": table_number}
+            f"table_{table.table_number}",
+            {"type": "order_update", "table_number": table.table_number}
         )
         # Notify the global dashboard listener (Dashboard page)
+        admin_id = table.admin_id if table.admin_id else 'global'
         async_to_sync(channel_layer.group_send)(
-            "dashboard",
-            {"type": "dashboard_update", "table_number": table_number}
+            f"dashboard_{admin_id}",
+            {"type": "dashboard_update", "table_number": table.table_number}
         )
     except Exception:
         pass
@@ -43,6 +44,14 @@ def broadcast_order_update(table_number):
 
 def serialize_order(order):
     payment = order.payment_records.first() if hasattr(order, 'payment_records') else None
+    
+    branch_name = "Unknown"
+    try:
+        if order.admin and hasattr(order.admin, 'cafelocation'):
+            branch_name = order.admin.cafelocation.branch_name
+    except Exception:
+        pass
+
     return {
         "order_number": order.order_number,
         "table_number": order.table.table_number if order.table else 'N/A',
@@ -50,6 +59,8 @@ def serialize_order(order):
         "phone_number": order.user.phone_number,
         "status": order.status,
         "payment_status": order.payment_status,
+        "payment_method": order.get_payment_method_display() if order.payment_method else None,
+        "branch_name": branch_name,
         "total_amount": order.total_amount,
         "created_at": order.created_at.isoformat(),
         "points_earned": payment.points_earned if payment else 0.0,
@@ -202,6 +213,7 @@ class PlaceOrderView(APIView):
         with transaction.atomic():
             total = sum(ci.line_total() for ci in cart_items)
             order = Order.objects.create(
+                admin=table.admin,
                 table=table, user=request.user, total_amount=total, status='order_sent'
             )
             order_items = [
@@ -216,7 +228,7 @@ class PlaceOrderView(APIView):
             OrderItem.objects.bulk_create(order_items)
             cart_items.delete()
 
-        broadcast_order_update(table.table_number)
+        broadcast_order_update(table)
 
         return success_response(
             {"order_number": order.order_number, "total_amount": total},
@@ -281,7 +293,7 @@ class AdminTableOrdersView(APIView):
 
     def get(self, request, table_number):
         try:
-            table = Table.objects.get(table_number=table_number)
+            table = Table.objects.get(admin=request.user, table_number=table_number)
         except Table.DoesNotExist:
             return error_response("Table not found.", "TABLE_NOT_FOUND", 404)
 
@@ -305,13 +317,13 @@ class AdminOrderStatusView(APIView):
             return error_response(f"Status must be one of {valid_statuses}.", "INVALID_STATUS")
 
         try:
-            order = Order.objects.select_related('table').get(order_number=order_number)
+            order = Order.objects.select_related('table').get(admin=request.user, order_number=order_number)
         except Order.DoesNotExist:
             return error_response("Order not found.", "ORDER_NOT_FOUND", 404)
 
         order.status = new_status
         order.save()
-        broadcast_order_update(order.table.table_number)
+        broadcast_order_update(order.table)
         return success_response({"order_number": order.order_number, "status": order.status}, "Status updated.")
 
 class MyActiveOrdersView(APIView):
@@ -333,7 +345,10 @@ class CancelOrderView(APIView):
 
     def post(self, request, order_number):
         try:
-            order = Order.objects.select_related('table').get(order_number=order_number)
+            if request.user.is_staff:
+                order = Order.objects.select_related('table').get(admin=request.user, order_number=order_number)
+            else:
+                order = Order.objects.select_related('table').get(order_number=order_number)
         except Order.DoesNotExist:
             return error_response("Order not found.", "ORDER_NOT_FOUND", 404)
 
@@ -351,7 +366,7 @@ class CancelOrderView(APIView):
 
         order.status = 'cancelled'
         order.save(update_fields=['status'])
-        broadcast_order_update(order.table.table_number)
+        broadcast_order_update(order.table)
 
         return success_response({"order_number": order.order_number, "status": order.status}, "Order cancelled successfully.")
 
@@ -402,5 +417,5 @@ class UserEditOrderView(APIView):
         order.total_amount = total
         order.save()
 
-        broadcast_order_update(order.table.table_number)
+        broadcast_order_update(order.table)
         return success_response({"order_number": order.order_number, "total_amount": order.total_amount}, "Order updated.")

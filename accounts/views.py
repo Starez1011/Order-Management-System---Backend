@@ -6,9 +6,9 @@ from rest_framework.response import Response
 from rest_framework import status
 from rest_framework_simplejwt.tokens import RefreshToken
 
-from .models import CustomUser, OTPRecord, Notification
-from .utils import generate_otp, send_otp_sms
-from .permissions import IsAuthenticatedUserCustom, IsAdminUserCustom, IsSuperAdminUserCustom
+from accounts.models import CustomUser, OTPRecord, Notification
+from accounts.utils import generate_otp, send_otp_sms
+from accounts.permissions import IsAuthenticatedUserCustom, IsAdminUserCustom, IsSuperAdminUserCustom
 from django.conf import settings
 
 
@@ -215,6 +215,14 @@ class ProfileView(APIView):
 
     def get(self, request):
         user = request.user
+        branch_name = None
+        
+        if user.is_staff and not user.is_superuser:
+            from tables.models import CafeLocation
+            loc = CafeLocation.objects.filter(admin=user).first()
+            if loc:
+                branch_name = loc.branch_name
+
         return success_response({
             "phone_number": user.phone_number,
             "first_name": user.first_name,
@@ -222,6 +230,7 @@ class ProfileView(APIView):
             "loyalty_points": user.loyalty_points,
             "is_verified": user.is_verified,
             "is_superuser": user.is_superuser,
+            "branch_name": branch_name,
         })
 
     def patch(self, request):
@@ -299,21 +308,74 @@ class SuperAdminStaffManagementView(APIView):
                 )
                 user.is_staff = True
                 user.save()
-            return success_response({"id": user.id, "phone_number": phone_number}, "Admin account created.", 201)
+                
+                # Auto-create CafeLocation for the new branch admin
+                from tables.models import CafeLocation
+                CafeLocation.objects.create(
+                    admin=user,
+                    restaurant_name="My Cafe",
+                    branch_name=f"Branch - {first_name}",
+                    name=f"Branch - {first_name}",
+                )
+                
+            return success_response({"id": user.id, "phone_number": phone_number}, "Admin account and branch created.", 201)
         except Exception as e:
             return error_response(str(e), "CREATE_ERROR")
 
     def patch(self, request, user_id):
-        """Toggle an admin's access (deactivate/activate)."""
+        """Toggle an admin's access (deactivate/activate) or reset password."""
         if request.user.id == user_id:
-            return error_response("Cannot deactivate your own superadmin account.", "SELF_ACTION")
+            return error_response("Cannot modify your own superadmin account.", "SELF_ACTION")
             
         try:
             target = CustomUser.objects.get(id=user_id, is_staff=True)
+            action = request.data.get("action")
+            
+            if action == "reset_password":
+                target.set_password("admin123")
+                target.save()
+                return success_response({}, "Password reset to admin123 successfully.")
+            
+            # Default toggle action
             target.is_active = not target.is_active
             target.save()
             status_text = "activated" if target.is_active else "deactivated"
             return success_response({"is_active": target.is_active}, f"Admin {status_text} successfully.")
+        except CustomUser.DoesNotExist:
+            return error_response("Admin user not found.", "NOT_FOUND", 404)
+
+    def put(self, request, user_id):
+        """Edit an admin's details."""
+        if request.user.id == user_id:
+            return error_response("Cannot edit your own superadmin account from here.", "SELF_ACTION")
+            
+        try:
+            target = CustomUser.objects.get(id=user_id, is_staff=True)
+            phone_number = request.data.get("phone_number", target.phone_number).strip()
+            first_name = request.data.get("first_name", target.first_name).strip()
+            last_name = request.data.get("last_name", target.last_name).strip()
+            
+            # Check phone number uniqueness if changed
+            if phone_number != target.phone_number and CustomUser.objects.filter(phone_number=phone_number).exists():
+                return error_response("Phone number already exists.", "PHONE_EXISTS")
+            
+            target.phone_number = phone_number
+            target.first_name = first_name
+            target.last_name = last_name
+            target.save()
+            return success_response({}, "Admin details updated successfully.")
+        except CustomUser.DoesNotExist:
+            return error_response("Admin user not found.", "NOT_FOUND", 404)
+
+    def delete(self, request, user_id):
+        """Delete an admin account entirely."""
+        if request.user.id == user_id:
+            return error_response("Cannot delete your own superadmin account.", "SELF_ACTION")
+            
+        try:
+            target = CustomUser.objects.get(id=user_id, is_staff=True)
+            target.delete()
+            return success_response({}, "Admin account deleted successfully.")
         except CustomUser.DoesNotExist:
             return error_response("Admin user not found.", "NOT_FOUND", 404)
 

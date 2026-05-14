@@ -5,9 +5,9 @@ from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
 
-from .models import CafeLocation, Table, TableSession
-from .utils import is_within_cafe
-from accounts.permissions import IsAuthenticatedUserCustom, IsAdminUserCustom
+from tables.models import CafeLocation, Table, TableSession
+from tables.utils import is_within_cafe
+from accounts.permissions import IsAuthenticatedUserCustom, IsAdminUserCustom, get_target_admin
 
 
 def success_response(data=None, message="Success", http_status=200):
@@ -50,9 +50,9 @@ class ValidateQRView(APIView):
         except Table.DoesNotExist:
             return error_response("Invalid or inactive QR code.", "INVALID_QR", 404)
 
-        # Validate location
-        cafe_loc = CafeLocation.objects.first()
-        if cafe_loc:
+        # Validate location against the specific branch's location
+        if hasattr(table.admin, 'cafe_location') and table.admin.cafe_location:
+            cafe_loc = table.admin.cafe_location
             if not is_within_cafe(user_lat, user_lon, cafe_loc.latitude, cafe_loc.longitude, cafe_loc.radius_meters):
                 return error_response(
                     "You must be inside the café to place an order.",
@@ -75,16 +75,17 @@ class ValidateQRView(APIView):
             "table_number": table.table_number,
             "qr_token": str(table.qr_token),
             "session_id": session.id,
+            "branch_id": table.admin.cafe_location.id if hasattr(table.admin, 'cafe_location') else None,
             "location_valid": True,
         }, "Table session started.")
-
 
 class TableListView(APIView):
     """Admin: list all tables."""
     permission_classes = [IsAdminUserCustom]
 
     def get(self, request):
-        tables = Table.objects.prefetch_related('sessions').all()
+        target_admin = get_target_admin(request)
+        tables = Table.objects.filter(admin=target_admin).prefetch_related('sessions')
         data = []
         for t in tables:
             active_session = t.sessions.filter(is_active=True).first()
@@ -97,12 +98,13 @@ class TableListView(APIView):
         return success_response(data)
 
     def post(self, request):
+        target_admin = get_target_admin(request)
         table_number = request.data.get("table_number")
         if not table_number:
             return error_response("table_number is required.", "MISSING_FIELD")
-        if Table.objects.filter(table_number=table_number).exists():
+        if Table.objects.filter(admin=target_admin, table_number=table_number).exists():
             return error_response("Table number already exists.", "TABLE_EXISTS")
-        table = Table.objects.create(table_number=table_number)
+        table = Table.objects.create(admin=target_admin, table_number=table_number)
         return success_response({
             "table_number": table.table_number,
             "qr_token": str(table.qr_token),
@@ -114,8 +116,9 @@ class TableDetailView(APIView):
     permission_classes = [IsAdminUserCustom]
 
     def get(self, request, table_number):
+        target_admin = get_target_admin(request)
         try:
-            table = Table.objects.get(table_number=table_number)
+            table = Table.objects.get(admin=target_admin, table_number=table_number)
         except Table.DoesNotExist:
             return error_response("Table not found.", "TABLE_NOT_FOUND", 404)
 
@@ -129,8 +132,9 @@ class TableDetailView(APIView):
         })
 
     def patch(self, request, table_number):
+        target_admin = get_target_admin(request)
         try:
-            table = Table.objects.get(table_number=table_number)
+            table = Table.objects.get(admin=target_admin, table_number=table_number)
         except Table.DoesNotExist:
             return error_response("Table not found.", "TABLE_NOT_FOUND", 404)
         table.is_active = request.data.get("is_active", table.is_active)
@@ -138,8 +142,9 @@ class TableDetailView(APIView):
         return success_response(message="Table updated.")
 
     def delete(self, request, table_number):
+        target_admin = get_target_admin(request)
         try:
-            table = Table.objects.get(table_number=table_number)
+            table = Table.objects.get(admin=target_admin, table_number=table_number)
         except Table.DoesNotExist:
             return error_response("Table not found.", "TABLE_NOT_FOUND", 404)
         table.delete()
@@ -155,11 +160,22 @@ class CafeLocationView(APIView):
         return [IsAdminUserCustom()]
 
     def get(self, request):
-        loc = CafeLocation.objects.first()
+        branch_id = request.GET.get("branch_id")
+        if branch_id:
+            loc = CafeLocation.objects.filter(id=branch_id).first()
+        elif getattr(request.user, 'is_staff', False):
+            target_admin = get_target_admin(request)
+            loc = getattr(target_admin, 'cafe_location', None)
+        else:
+            return error_response("Please specify a branch_id.", "MISSING_BRANCH_ID", 400)
+
         if not loc:
             return error_response("Café location not configured.", "NO_LOCATION", 404)
+            
         return success_response({
-            "name": loc.name,
+            "id": loc.id,
+            "restaurant_name": loc.restaurant_name,
+            "branch_name": loc.branch_name,
             "address": loc.address,
             "phone_number": loc.phone_number,
             "latitude": loc.latitude,
@@ -168,25 +184,61 @@ class CafeLocationView(APIView):
         })
 
     def post(self, request):
-        lat = request.data.get("latitude")
-        lon = request.data.get("longitude")
-        radius = request.data.get("radius_meters", 100.0)
-        name = request.data.get("name", "Main Café")
+        target_admin = get_target_admin(request)
+        loc = getattr(target_admin, 'cafe_location', None)
+
+        restaurant_name = request.data.get("restaurant_name", "My Cafe")
+        branch_name = request.data.get("branch_name", "Main Branch")
         address = request.data.get("address", "")
         phone_number = request.data.get("phone_number", "")
         
-        if lat is None or lon is None:
-            return error_response("latitude and longitude are required.", "MISSING_FIELDS")
+        # Superadmins cannot update GPS coordinates. Only local admins can.
+        if request.user.is_superuser and loc:
+            lat = loc.latitude
+            lon = loc.longitude
+            radius = loc.radius_meters
+        else:
+            lat = request.data.get("latitude")
+            lon = request.data.get("longitude")
+            radius = request.data.get("radius_meters", 100.0)
+            
+            if lat is None or lon is None:
+                if loc:
+                    lat, lon = loc.latitude, loc.longitude
+                else:
+                    return error_response("latitude and longitude are required.", "MISSING_FIELDS")
             
         loc, _ = CafeLocation.objects.update_or_create(
-            pk=1,
+            admin=target_admin,
             defaults={
                 "latitude": float(lat), 
                 "longitude": float(lon),
                 "radius_meters": float(radius), 
-                "name": name,
+                "restaurant_name": restaurant_name,
+                "branch_name": branch_name,
                 "address": address,
                 "phone_number": phone_number
             }
         )
         return success_response(message="Café location updated.")
+
+class CafeLocationListView(APIView):
+    """Public: list all available branches/locations for the mobile app."""
+    
+    def get(self, request):
+        # Alphabetical by restaurant_name then branch_name
+        locations = CafeLocation.objects.all().order_by('restaurant_name', 'branch_name')
+        data = [
+            {
+                "id": loc.id,
+                "admin_id": loc.admin_id,
+                "restaurant_name": loc.restaurant_name,
+                "branch_name": loc.branch_name,
+                "address": loc.address,
+                "phone_number": loc.phone_number,
+                "latitude": loc.latitude,
+                "longitude": loc.longitude,
+            }
+            for loc in locations
+        ]
+        return success_response(data)

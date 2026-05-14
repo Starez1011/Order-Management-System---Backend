@@ -49,6 +49,9 @@ class Order(models.Model):
     ]
 
     order_number = models.CharField(max_length=20, unique=True, editable=False)
+    admin = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='admin_orders', null=True
+    )
     table = models.ForeignKey(
         'tables.Table', on_delete=models.CASCADE, related_name='orders'
     )

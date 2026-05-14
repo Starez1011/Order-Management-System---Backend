@@ -5,12 +5,14 @@ from django.conf import settings
 
 
 class CafeLocation(models.Model):
-    """Single record storing the café's GPS location and valid radius."""
-    name = models.CharField(max_length=100, default="Main Café")
+    """Single record storing the café's GPS location and valid radius per branch/admin."""
+    admin = models.OneToOneField(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='cafe_location', null=True)
+    restaurant_name = models.CharField(max_length=100, default="My Cafe")
+    branch_name = models.CharField(max_length=100, default="Main Branch")
     address = models.CharField(max_length=255, blank=True, default="")
     phone_number = models.CharField(max_length=20, blank=True, default="")
-    latitude = models.FloatField()
-    longitude = models.FloatField()
+    latitude = models.FloatField(default=0.0)
+    longitude = models.FloatField(default=0.0)
     radius_meters = models.FloatField(default=100.0)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -23,7 +25,8 @@ class CafeLocation(models.Model):
 
 class Table(models.Model):
     """Represents a physical table in the cafe."""
-    table_number = models.CharField(max_length=50, unique=True)
+    admin = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='tables', null=True)
+    table_number = models.CharField(max_length=50) # Removed unique=True to allow same table_number across branches
     qr_token = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
     is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -31,6 +34,7 @@ class Table(models.Model):
     class Meta:
         db_table = 'tables'
         ordering = ['table_number']
+        unique_together = ('admin', 'table_number')
 
     def __str__(self):
         return f"Table {self.table_number}"

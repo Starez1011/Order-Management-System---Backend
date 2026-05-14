@@ -4,8 +4,8 @@ from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
 
-from .models import Category, MenuItem
-from accounts.permissions import IsAdminUserCustom
+from menu.models import Category, MenuItem
+from accounts.permissions import IsAdminUserCustom, get_target_admin
 
 
 def success_response(data=None, message="Success", http_status=200):
@@ -19,7 +19,7 @@ def error_response(message, error_code="ERROR", http_status=400):
 def serialize_item(item, request=None):
     image_url = None
     if item.image:
-        image_url = request.build_absolute_uri(item.image.url) if request else item.image.url
+        image_url = item.image.url
     return {
         "id": item.id,
         "name": item.name,
@@ -29,6 +29,7 @@ def serialize_item(item, request=None):
         "description": item.description,
         "image_url": image_url,
         "is_available": item.is_available,
+        "is_global": item.admin.is_superuser if hasattr(item, 'admin') and item.admin else False,
     }
 
 
@@ -41,27 +42,61 @@ def serialize_category(cat, request=None):
     }
 
 
+from django.db.models import Q
+
 # ──────────────────────────── Customer Views ────────────────────────────
 
 class MenuView(APIView):
-    """Public: full menu grouped by active category."""
+    """Public: full menu grouped by active category.
+    Returns BOTH global (superadmin) items and branch-local items.
+    """
 
     def get(self, request):
-        categories = (
-            Category.objects
-            .filter(is_active=True)
-            .prefetch_related('items')
-        )
-        data = [serialize_category(c, request) for c in categories]
-        return success_response(data)
+        branch_id = request.GET.get('branch_id')
+        
+        # Admin dashboard fallback: if branch_id is missing, try to derive it from the admin context
+        if not branch_id and request.user and request.user.is_authenticated and request.user.is_staff:
+            target_admin = get_target_admin(request)
+            if hasattr(target_admin, 'cafe_location') and target_admin.cafe_location:
+                branch_id = target_admin.cafe_location.id
+
+        if not branch_id:
+            return error_response("branch_id is required to fetch the menu.", "MISSING_BRANCH_ID", 400)
+
+        try:
+            # Include: categories owned by the branch's admin (local)
+            #      OR: categories owned by the superuser (global)
+            categories = (
+                Category.objects
+                .filter(
+                    Q(admin__cafe_location__id=branch_id) | Q(admin__is_superuser=True),
+                    is_active=True
+                )
+                .select_related('admin')
+                .prefetch_related('items')
+                .distinct()
+            )
+            data = [serialize_category(c, request) for c in categories]
+            return success_response(data)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return error_response(f"Failed to load menu: {str(e)}", "SERVER_ERROR", 500)
 
 
 class CategoryItemsView(APIView):
     """Public: items for a single category."""
 
     def get(self, request, category_id):
+        branch_id = request.GET.get('branch_id')
         try:
-            cat = Category.objects.prefetch_related('items').get(pk=category_id, is_active=True)
+            if branch_id:
+                cat = Category.objects.prefetch_related('items').get(
+                    Q(admin__cafe_location__id=branch_id) | Q(admin__is_superuser=True),
+                    pk=category_id, is_active=True
+                )
+            else:
+                cat = Category.objects.prefetch_related('items').get(pk=category_id, is_active=True)
         except Category.DoesNotExist:
             return error_response("Category not found.", "CATEGORY_NOT_FOUND", 404)
         return success_response(serialize_category(cat, request))
@@ -73,17 +108,27 @@ class AdminCategoryListView(APIView):
     permission_classes = [IsAdminUserCustom]
 
     def get(self, request):
-        cats = Category.objects.all()
-        data = [{"id": c.id, "name": c.name, "is_active": c.is_active} for c in cats]
+        target_admin = get_target_admin(request)
+        if target_admin.is_superuser:
+            cats = Category.objects.filter(admin=target_admin)
+        else:
+            cats = Category.objects.filter(
+                Q(admin=target_admin) | Q(admin__is_superuser=True)
+            ).distinct()
+            
+        data = [{"id": c.id, "name": c.name, "is_active": c.is_active, "is_global": c.admin.is_superuser} for c in cats]
         return success_response(data)
 
     def post(self, request):
+        target_admin = get_target_admin(request)
         name = request.data.get("name", "").strip()
         if not name:
-            return error_response("Category name is required.", "MISSING_NAME")
-        if Category.objects.filter(name__iexact=name).exists():
-            return error_response("Category already exists.", "CATEGORY_EXISTS")
-        cat = Category.objects.create(name=name)
+            return error_response("Category name is required.")
+
+        if Category.objects.filter(admin=target_admin, name__iexact=name).exists():
+            return error_response("Category with this name already exists.", "CATEGORY_EXISTS")
+
+        cat = Category.objects.create(admin=target_admin, name=name)
         return success_response({"id": cat.id, "name": cat.name}, "Category created.", 201)
 
 
@@ -91,8 +136,9 @@ class AdminCategoryDetailView(APIView):
     permission_classes = [IsAdminUserCustom]
 
     def patch(self, request, category_id):
+        target_admin = get_target_admin(request)
         try:
-            cat = Category.objects.get(pk=category_id)
+            cat = Category.objects.get(pk=category_id, admin=target_admin)
         except Category.DoesNotExist:
             return error_response("Category not found.", "CATEGORY_NOT_FOUND", 404)
         cat.name = request.data.get("name", cat.name)
@@ -101,8 +147,9 @@ class AdminCategoryDetailView(APIView):
         return success_response(message="Category updated.")
 
     def delete(self, request, category_id):
+        target_admin = get_target_admin(request)
         try:
-            cat = Category.objects.get(pk=category_id)
+            cat = Category.objects.get(pk=category_id, admin=target_admin)
         except Category.DoesNotExist:
             return error_response("Category not found.", "CATEGORY_NOT_FOUND", 404)
         cat.delete()
@@ -115,11 +162,18 @@ class AdminMenuItemListView(APIView):
     permission_classes = [IsAdminUserCustom]
 
     def get(self, request):
-        items = MenuItem.objects.select_related('category').all()
+        target_admin = get_target_admin(request)
+        if target_admin.is_superuser:
+            items = MenuItem.objects.select_related('category').filter(category__admin=target_admin)
+        else:
+            items = MenuItem.objects.select_related('category').filter(
+                Q(category__admin=target_admin) | Q(category__admin__is_superuser=True)
+            ).distinct()
         data = [serialize_item(i, request) for i in items]
         return success_response(data)
 
     def post(self, request):
+        target_admin = get_target_admin(request)
         name = request.data.get("name", "").strip()
         category_id = request.data.get("category_id")
         price = request.data.get("price")
@@ -129,7 +183,7 @@ class AdminMenuItemListView(APIView):
             return error_response("name, category_id, and price are required.", "MISSING_FIELDS")
 
         try:
-            category = Category.objects.get(pk=category_id)
+            category = Category.objects.get(pk=category_id, admin=target_admin)
         except Category.DoesNotExist:
             return error_response("Category not found.", "CATEGORY_NOT_FOUND", 404)
 
@@ -141,7 +195,7 @@ class AdminMenuItemListView(APIView):
             return error_response("Invalid price.", "INVALID_PRICE")
 
         item = MenuItem.objects.create(
-            name=name, category=category, price=price, description=description,
+            admin=target_admin, name=name, category=category, price=price, description=description,
             image=request.FILES.get("image"),
         )
         return success_response(serialize_item(item, request), "Item created.", 201)
@@ -151,8 +205,9 @@ class AdminMenuItemDetailView(APIView):
     permission_classes = [IsAdminUserCustom]
 
     def patch(self, request, item_id):
+        target_admin = get_target_admin(request)
         try:
-            item = MenuItem.objects.select_related('category').get(pk=item_id)
+            item = MenuItem.objects.select_related('category').get(pk=item_id, admin=target_admin)
         except MenuItem.DoesNotExist:
             return error_response("Item not found.", "ITEM_NOT_FOUND", 404)
 
@@ -170,7 +225,7 @@ class AdminMenuItemDetailView(APIView):
         category_id = request.data.get("category_id")
         if category_id:
             try:
-                item.category = Category.objects.get(pk=category_id)
+                item.category = Category.objects.get(pk=category_id, admin=target_admin)
             except Category.DoesNotExist:
                 return error_response("Category not found.", "CATEGORY_NOT_FOUND", 404)
 
@@ -183,8 +238,9 @@ class AdminMenuItemDetailView(APIView):
         return success_response(serialize_item(item, request), "Item updated.")
 
     def delete(self, request, item_id):
+        target_admin = get_target_admin(request)
         try:
-            item = MenuItem.objects.get(pk=item_id)
+            item = MenuItem.objects.get(pk=item_id, admin=target_admin)
         except MenuItem.DoesNotExist:
             return error_response("Item not found.", "ITEM_NOT_FOUND", 404)
         item.delete()

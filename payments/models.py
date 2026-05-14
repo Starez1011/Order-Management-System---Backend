@@ -5,6 +5,7 @@ import uuid
 
 
 class Payment(models.Model):
+    admin = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='admin_payments', null=True)
     table = models.ForeignKey(
         'tables.Table', on_delete=models.SET_NULL, null=True, related_name='payments'
     )
@@ -29,6 +30,7 @@ class Payment(models.Model):
 
 class PaymentRequest(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    admin = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='admin_payment_requests', null=True)
     table = models.ForeignKey('tables.Table', on_delete=models.CASCADE, related_name='payment_requests')
     amount_requested = models.FloatField()
     points_required = models.FloatField()
