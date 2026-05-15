@@ -26,6 +26,8 @@ def serialize_item(item, request=None):
         "category": item.category.name,
         "category_id": item.category.id,
         "price": str(item.price),
+        "discount_percentage": item.discount_percentage,
+        "discounted_price": str(item.discounted_price) if item.discounted_price is not None else None,
         "description": item.description,
         "image_url": image_url,
         "is_available": item.is_available,
@@ -177,6 +179,8 @@ class AdminMenuItemListView(APIView):
         name = request.data.get("name", "").strip()
         category_id = request.data.get("category_id")
         price = request.data.get("price")
+        discount_percentage = request.data.get("discount_percentage")
+        discounted_price = request.data.get("discounted_price")
         description = request.data.get("description", "")
 
         if not all([name, category_id, price]):
@@ -196,6 +200,8 @@ class AdminMenuItemListView(APIView):
 
         item = MenuItem.objects.create(
             admin=target_admin, name=name, category=category, price=price, description=description,
+            discount_percentage=int(discount_percentage) if discount_percentage else None,
+            discounted_price=float(discounted_price) if discounted_price else None,
             image=request.FILES.get("image"),
         )
         return success_response(serialize_item(item, request), "Item created.", 201)
@@ -221,6 +227,14 @@ class AdminMenuItemDetailView(APIView):
                 item.price = float(price)
             except (TypeError, ValueError):
                 return error_response("Invalid price.", "INVALID_PRICE")
+
+        dp_val = request.data.get("discount_percentage")
+        if dp_val is not None:
+            item.discount_percentage = int(dp_val) if dp_val != "" else None
+        
+        dprice_val = request.data.get("discounted_price")
+        if dprice_val is not None:
+            item.discounted_price = float(dprice_val) if dprice_val != "" else None
 
         category_id = request.data.get("category_id")
         if category_id:

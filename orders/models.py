@@ -23,7 +23,8 @@ class Cart(models.Model):
         unique_together = ['user', 'table', 'item']
 
     def line_total(self):
-        return float(self.item.price) * self.quantity
+        price = self.item.discounted_price if self.item.discounted_price else self.item.price
+        return float(price) * self.quantity
 
     def __str__(self):
         return f"{self.user.phone_number} | Table {self.table.table_number} | {self.item.name} x{self.quantity}"

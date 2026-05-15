@@ -356,13 +356,14 @@ class AdminOrderCreateView(APIView):
             if qty <= 0:
                 continue
             
+            actual_price = menu_item.discounted_price if menu_item.discounted_price else menu_item.price
             OrderItem.objects.create(
                 order=order,
                 item=menu_item,
                 quantity=qty,
-                price=menu_item.price
+                price=actual_price
             )
-            total += float(menu_item.price) * qty
+            total += float(actual_price) * qty
         
         if total == 0:
             order.delete()
@@ -417,13 +418,14 @@ class AdminOrderEditView(APIView):
             total = 0.0
             
             for v_item in valid_items:
+                actual_price = v_item["menu_item"].discounted_price if v_item["menu_item"].discounted_price else v_item["menu_item"].price
                 OrderItem.objects.create(
                     order=order,
                     item=v_item["menu_item"],
                     quantity=v_item["quantity"],
-                    price=v_item["menu_item"].price
+                    price=actual_price
                 )
-                total += float(v_item["menu_item"].price) * v_item["quantity"]
+                total += float(actual_price) * v_item["quantity"]
             
             order.total_amount = total
             order.save()
@@ -632,7 +634,7 @@ class PopularItemsView(APIView):
 
         top_items = (
             qs
-            .values('item__id', 'item__name', 'item__price', 'item__image')
+            .values('item__id', 'item__name', 'item__price', 'item__image', 'item__discount_percentage', 'item__discounted_price')
             .annotate(total_ordered=Count('id'))
             .order_by('-total_ordered')[:8]
         )
@@ -649,6 +651,8 @@ class PopularItemsView(APIView):
                 "id": row['item__id'],
                 "name": row['item__name'],
                 "price": str(row['item__price']),
+                "discount_percentage": row.get('item__discount_percentage'),
+                "discounted_price": str(row['item__discounted_price']) if row.get('item__discounted_price') else None,
                 "image_url": img,
                 "total_ordered": row['total_ordered'],
             })

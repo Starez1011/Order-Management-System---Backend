@@ -107,6 +107,8 @@ class CartView(APIView):
                 "item_id": ci.item.id,
                 "name": ci.item.name,
                 "price": str(ci.item.price),
+                "discount_percentage": ci.item.discount_percentage,
+                "discounted_price": str(ci.item.discounted_price) if ci.item.discounted_price else None,
                 "quantity": ci.quantity,
                 "line_total": ci.line_total(),
             }
@@ -221,7 +223,7 @@ class PlaceOrderView(APIView):
                     order=order,
                     item=ci.item,
                     quantity=ci.quantity,
-                    price=float(ci.item.price),
+                    price=float(ci.item.discounted_price) if ci.item.discounted_price else float(ci.item.price),
                 )
                 for ci in cart_items
             ]
