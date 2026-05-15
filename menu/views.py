@@ -66,8 +66,6 @@ class MenuView(APIView):
             return error_response("branch_id is required to fetch the menu.", "MISSING_BRANCH_ID", 400)
 
         try:
-            # Include: categories owned by the branch's admin (local)
-            #      OR: categories owned by the superuser (global)
             categories = (
                 Category.objects
                 .filter(
@@ -140,9 +138,12 @@ class AdminCategoryDetailView(APIView):
     def patch(self, request, category_id):
         target_admin = get_target_admin(request)
         try:
-            cat = Category.objects.get(pk=category_id, admin=target_admin)
+            cat = Category.objects.get(pk=category_id)
+            if cat.admin != target_admin and not (request.user.is_superuser and cat.admin.is_superuser):
+                return error_response("Category not found.", "CATEGORY_NOT_FOUND", 404)
         except Category.DoesNotExist:
             return error_response("Category not found.", "CATEGORY_NOT_FOUND", 404)
+
         cat.name = request.data.get("name", cat.name)
         cat.is_active = request.data.get("is_active", cat.is_active)
         cat.save()
@@ -151,7 +152,9 @@ class AdminCategoryDetailView(APIView):
     def delete(self, request, category_id):
         target_admin = get_target_admin(request)
         try:
-            cat = Category.objects.get(pk=category_id, admin=target_admin)
+            cat = Category.objects.get(pk=category_id)
+            if cat.admin != target_admin and not (request.user.is_superuser and cat.admin.is_superuser):
+                return error_response("Category not found.", "CATEGORY_NOT_FOUND", 404)
         except Category.DoesNotExist:
             return error_response("Category not found.", "CATEGORY_NOT_FOUND", 404)
         cat.delete()
@@ -171,6 +174,7 @@ class AdminMenuItemListView(APIView):
             items = MenuItem.objects.select_related('category').filter(
                 Q(category__admin=target_admin) | Q(category__admin__is_superuser=True)
             ).distinct()
+            
         data = [serialize_item(i, request) for i in items]
         return success_response(data)
 
@@ -213,7 +217,9 @@ class AdminMenuItemDetailView(APIView):
     def patch(self, request, item_id):
         target_admin = get_target_admin(request)
         try:
-            item = MenuItem.objects.select_related('category').get(pk=item_id, admin=target_admin)
+            item = MenuItem.objects.select_related('category').get(pk=item_id)
+            if item.admin != target_admin and not (request.user.is_superuser and item.admin.is_superuser):
+                return error_response("Item not found.", "ITEM_NOT_FOUND", 404)
         except MenuItem.DoesNotExist:
             return error_response("Item not found.", "ITEM_NOT_FOUND", 404)
 
@@ -254,7 +260,9 @@ class AdminMenuItemDetailView(APIView):
     def delete(self, request, item_id):
         target_admin = get_target_admin(request)
         try:
-            item = MenuItem.objects.get(pk=item_id, admin=target_admin)
+            item = MenuItem.objects.get(pk=item_id)
+            if item.admin != target_admin and not (request.user.is_superuser and item.admin.is_superuser):
+                return error_response("Item not found.", "ITEM_NOT_FOUND", 404)
         except MenuItem.DoesNotExist:
             return error_response("Item not found.", "ITEM_NOT_FOUND", 404)
         item.delete()
