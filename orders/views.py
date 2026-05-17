@@ -12,7 +12,7 @@ from asgiref.sync import async_to_sync
 from orders.models import Cart, Order, OrderItem
 from tables.models import Table, TableSession
 from menu.models import MenuItem
-from accounts.permissions import IsAuthenticatedUserCustom, IsAdminUserCustom
+from accounts.permissions import IsAuthenticatedUserCustom, IsAdminUserCustom, get_target_admin
 
 
 def success_response(data=None, message="Success", http_status=200):
@@ -47,19 +47,19 @@ def serialize_order(order):
     
     branch_name = "Unknown"
     try:
-        if order.admin and hasattr(order.admin, 'cafelocation'):
-            branch_name = order.admin.cafelocation.branch_name
+        if order.admin and hasattr(order.admin, 'cafe_location'):
+            branch_name = order.admin.cafe_location.branch_name
     except Exception:
         pass
 
     return {
         "order_number": order.order_number,
         "table_number": order.table.table_number if order.table else 'N/A',
-        "user_name": order.user.get_full_name(),
-        "phone_number": order.user.phone_number,
+        "user_name": order.user.get_full_name() if order.user else "Walk-in Customer",
+        "phone_number": order.user.phone_number if order.user else "",
         "status": order.status,
         "payment_status": order.payment_status,
-        "payment_method": order.get_payment_method_display() if order.payment_method else None,
+        "payment_method": order.payment_method if order.payment_method else None,
         "branch_name": branch_name,
         "total_amount": order.total_amount,
         "created_at": order.created_at.isoformat(),
@@ -72,6 +72,8 @@ def serialize_order(order):
                 "name": oi.item.name,
                 "quantity": oi.quantity,
                 "price": oi.price,
+                "discount_percentage": oi.item.discount_percentage,
+                "discounted_price": oi.item.discounted_price,
                 "line_total": oi.line_total(),
             }
             for oi in order.items.select_related('item').all()
@@ -294,8 +296,18 @@ class AdminTableOrdersView(APIView):
     permission_classes = [IsAdminUserCustom]
 
     def get(self, request, table_number):
+        target_admin = get_target_admin(request)
         try:
-            table = Table.objects.get(admin=request.user, table_number=table_number)
+            if request.user.is_superuser:
+                if target_admin == request.user:
+                    # No specific branch selected — find by table_number globally
+                    table = Table.objects.filter(table_number=table_number).first()
+                    if not table:
+                        return error_response("Table not found.", "TABLE_NOT_FOUND", 404)
+                else:
+                    table = Table.objects.get(table_number=table_number, admin=target_admin)
+            else:
+                table = Table.objects.get(admin=request.user, table_number=table_number)
         except Table.DoesNotExist:
             return error_response("Table not found.", "TABLE_NOT_FOUND", 404)
 
@@ -319,7 +331,10 @@ class AdminOrderStatusView(APIView):
             return error_response(f"Status must be one of {valid_statuses}.", "INVALID_STATUS")
 
         try:
-            order = Order.objects.select_related('table').get(admin=request.user, order_number=order_number)
+            if request.user.is_superuser:
+                order = Order.objects.select_related('table').get(order_number=order_number)
+            else:
+                order = Order.objects.select_related('table').get(admin=request.user, order_number=order_number)
         except Order.DoesNotExist:
             return error_response("Order not found.", "ORDER_NOT_FOUND", 404)
 

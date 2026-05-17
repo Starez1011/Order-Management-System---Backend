@@ -9,8 +9,9 @@ from django.db.models.functions import TruncDay, TruncMonth, TruncYear
 from admin_panel.models import SystemConfig, Banner, Offer
 from orders.models import Order, OrderItem
 from tables.models import Table, TableSession
-from payments.models import Payment
+from payments.models import Payment, CustomPaymentMethod
 from menu.models import MenuItem
+from django.core.paginator import Paginator
 from accounts.models import CustomUser
 from accounts.permissions import IsAdminUserCustom, IsSuperAdminUserCustom, get_target_admin
 from orders.views import broadcast_order_update
@@ -102,10 +103,10 @@ class DashboardView(APIView):
                 "total_due": total_due,
             })
 
-        # Today's revenue
-        today_payments = Payment.objects.filter(admin=target_admin, created_at__date=today)
-        today_revenue = sum(p.cash_paid for p in today_payments)
-        today_orders = Order.objects.filter(admin=target_admin, created_at__date=today).exclude(status='cancelled').count()
+        # Today's revenue and orders based on Order model for consistency
+        today_orders_qs = Order.objects.filter(admin=target_admin, created_at__date=today).exclude(status='cancelled')
+        today_revenue = sum(o.total_amount for o in today_orders_qs if o.status in ['paid', 'paid_by_points'])
+        today_orders = today_orders_qs.count()
 
         return success_response({
             "tables": table_data,
@@ -115,50 +116,152 @@ class DashboardView(APIView):
         })
 
 class RevenueAnalyticsView(APIView):
-    """Admin: detailed historical revenue analytics grouped by day, month, and year."""
+    """Admin: Kanban-style revenue analytics with filtering and pagination."""
     permission_classes = [IsAdminUserCustom]
 
     def get(self, request):
         target_admin = get_target_admin(request)
-        # We look at all payments, grouped by different time truncations
-        
-        # Daywise (last 30 days)
-        thirty_days_ago = timezone.now() - timezone.timedelta(days=30)
-        daywise = Payment.objects.filter(admin=target_admin, created_at__gte=thirty_days_ago) \
-            .annotate(date=TruncDay('created_at')) \
-            .values('date') \
-            .annotate(revenue=Sum('cash_paid')) \
-            .order_by('-date')
-            
-        # Monthwise (last 12 months)
-        twelve_months_ago = timezone.now() - timezone.timedelta(days=365)
-        monthwise = Payment.objects.filter(admin=target_admin, created_at__gte=twelve_months_ago) \
-            .annotate(month=TruncMonth('created_at')) \
-            .values('month') \
-            .annotate(revenue=Sum('cash_paid')) \
-            .order_by('-month')
-            
-        # Yearwise (all time)
-        yearwise = Payment.objects.filter(admin=target_admin).annotate(year=TruncYear('created_at')) \
-            .values('year') \
-            .annotate(revenue=Sum('cash_paid')) \
-            .order_by('-year')
+        filter_type = request.query_params.get('filter', 'weekly') # weekly, monthly, 6_months, yearly
+        page = int(request.query_params.get('page', 1))
+        page_size = 50
 
-        # Format dates for JSON
-        def format_day(d):
-            return { "period": d['date'].strftime('%Y-%m-%d'), "revenue": d['revenue'] or 0 }
+        now = timezone.now()
+        if filter_type == 'weekly':
+            start_date = now - timezone.timedelta(days=7)
+        elif filter_type == 'monthly':
+            start_date = now - timezone.timedelta(days=30)
+        elif filter_type == '6_months':
+            start_date = now - timezone.timedelta(days=180)
+        elif filter_type == 'yearly':
+            start_date = now - timezone.timedelta(days=365)
+        else:
+            start_date = now - timezone.timedelta(days=7)
+
+        # Get all paid orders for the admin in the date range
+        orders = Order.objects.filter(
+            admin=target_admin,
+            status__in=['paid', 'paid_by_points'],
+            created_at__gte=start_date
+        ).order_by('-created_at')
+
+        # Calculate totals per payment method globally for this filter
+        totals = {}
+        for o in orders:
+            pm = o.payment_method or "Unknown"
+            if pm not in totals:
+                totals[pm] = 0.0
+            totals[pm] += o.total_amount
+
+        # Paginate orders
+        paginator = Paginator(orders, page_size)
+        try:
+            page_obj = paginator.page(page)
+        except Exception:
+            page_obj = paginator.page(paginator.num_pages) if paginator.num_pages > 0 else []
+
+        # Group paginated orders
+        grouped_orders = {}
+        for o in page_obj:
+            pm = o.payment_method or "Unknown"
+            if pm not in grouped_orders:
+                grouped_orders[pm] = []
             
-        def format_month(m):
-            return { "period": m['month'].strftime('%Y-%m'), "revenue": m['revenue'] or 0 }
-            
-        def format_year(y):
-            return { "period": y['year'].strftime('%Y'), "revenue": y['revenue'] or 0 }
+            customer_name = "Walk-in Customer"
+            if o.user:
+                customer_name = f"{o.user.first_name} {o.user.last_name}".strip()
+
+            grouped_orders[pm].append({
+                "order_number": o.order_number,
+                "total_amount": o.total_amount,
+                "created_at": o.created_at.isoformat(),
+                "customer_name": customer_name,
+                "table_number": o.table.table_number,
+                "payment_method": pm,
+                "status": o.status,
+                "payment_status": o.payment_status,
+                "phone_number": o.user.phone_number if o.user else "",
+                "items": [
+                    {"name": oi.item.name, "quantity": oi.quantity, "price": oi.price}
+                    for oi in o.items.all()
+                ],
+            })
+
+        # Ensure all columns exist in grouped_orders even if empty on this page
+        for pm in totals.keys():
+            if pm not in grouped_orders:
+                grouped_orders[pm] = []
 
         return success_response({
-            "daywise": [format_day(d) for d in daywise],
-            "monthwise": [format_month(m) for m in monthwise],
-            "yearwise": [format_year(y) for y in yearwise]
+            "totals": totals,
+            "orders": grouped_orders,
+            "columns": list(totals.keys()),
+            "current_page": page,
+            "total_pages": paginator.num_pages,
+            "total_orders": paginator.count
         })
+
+class PaymentMethodListView(APIView):
+    """Admin: Manage custom payment methods."""
+    permission_classes = [IsAdminUserCustom]
+
+    def get(self, request):
+        target_admin = get_target_admin(request)
+        methods = CustomPaymentMethod.objects.filter(admin=target_admin, is_active=True).order_by('created_at')
+        
+        # Also always return standard ones as default options if needed, but the user requested 
+        # that admins create their own. Legacy "Cash" and "Online" can be created manually if they want.
+        data = [{"id": m.id, "name": m.name} for m in methods]
+        return success_response(data)
+
+    def post(self, request):
+        target_admin = get_target_admin(request)
+        name = request.data.get("name", "").strip()
+        if not name:
+            return error_response("Name is required.", "INVALID_INPUT")
+
+        # Create or reactivate
+        method, created = CustomPaymentMethod.objects.get_or_create(
+            admin=target_admin, name=name,
+            defaults={"is_active": True}
+        )
+        if not created and not method.is_active:
+            method.is_active = True
+            method.save()
+            
+        return success_response({"id": method.id, "name": method.name}, "Payment method created.")
+
+class PaymentMethodDetailView(APIView):
+    """Admin: update or soft-delete custom payment method."""
+    permission_classes = [IsAdminUserCustom]
+
+    def delete(self, request, pk):
+        target_admin = get_target_admin(request)
+        try:
+            method = CustomPaymentMethod.objects.get(pk=pk, admin=target_admin)
+            method.is_active = False
+            method.save()
+            return success_response(None, "Payment method deleted.")
+        except CustomPaymentMethod.DoesNotExist:
+            return error_response("Not found.", "NOT_FOUND", 404)
+
+class UpdateOrderPaymentMethodView(APIView):
+    """Admin: Update payment method of an existing paid order."""
+    permission_classes = [IsAdminUserCustom]
+
+    def patch(self, request, order_number):
+        target_admin = get_target_admin(request)
+        new_payment_method = request.data.get("payment_method", "").strip()
+        
+        if not new_payment_method:
+            return error_response("payment_method is required.", "INVALID_INPUT")
+            
+        try:
+            order = Order.objects.get(order_number=order_number, admin=target_admin)
+            order.payment_method = new_payment_method
+            order.save()
+            return success_response(None, "Order payment method updated.")
+        except Order.DoesNotExist:
+            return error_response("Order not found.", "NOT_FOUND", 404)
 
 class ClearTableView(APIView):
     """Admin: clear a table after payment — close session, reset status."""
@@ -292,12 +395,12 @@ class AdminOrderHistoryView(APIView):
             {
                 "order_number": o.order_number,
                 "table_number": o.table.table_number,
-                "user_name": o.user.get_full_name(),
-                "phone_number": o.user.phone_number,
+                "user_name": o.user.get_full_name() if o.user else "Walk-in Customer",
+                "phone_number": o.user.phone_number if o.user else "N/A",
                 "status": o.status,
                 "payment_status": o.payment_status,
-                "payment_method": o.get_payment_method_display() if o.payment_method else None,
-                "branch_name": o.admin.cafelocation.branch_name if hasattr(o.admin, 'cafelocation') else 'Unknown',
+                "payment_method": o.payment_method if o.payment_method else None,
+                "branch_name": o.admin.cafe_location.branch_name if hasattr(o.admin, 'cafe_location') else 'Unknown',
                 "total_amount": o.total_amount,
                 "created_at": o.created_at.isoformat(),
                 "items": [
@@ -315,8 +418,9 @@ class AdminOrderCreateView(APIView):
 
     @transaction.atomic
     def post(self, request, table_number):
+        target_admin = get_target_admin(request)
         try:
-            table = Table.objects.get(table_number=table_number)
+            table = Table.objects.get(table_number=table_number, admin=target_admin)
         except Table.DoesNotExist:
             return error_response("Table not found.", "TABLE_NOT_FOUND", 404)
 
@@ -338,7 +442,7 @@ class AdminOrderCreateView(APIView):
 
         # Create order
         order = Order.objects.create(
-            admin=request.user,
+            admin=target_admin,
             table=table,
             user=user,
             status='order_sent',
@@ -432,6 +536,22 @@ class AdminOrderEditView(APIView):
 
         broadcast_order_update(order.table)
         return success_response({"order_number": order.order_number, "total_amount": order.total_amount}, "Order updated.")
+
+    def delete(self, request, order_number):
+        try:
+            # Allow superadmin or the admin who created it to delete
+            if request.user.is_superuser:
+                order = Order.objects.get(order_number=order_number)
+            else:
+                order = Order.objects.get(order_number=order_number, admin=request.user)
+                
+            table = order.table
+            order.delete()
+            if table:
+                broadcast_order_update(table)
+            return success_response(None, "Order deleted successfully.")
+        except Order.DoesNotExist:
+            return error_response("Order not found or unauthorized.", "ORDER_NOT_FOUND", 404)
 
 from accounts.models import CustomUser
 

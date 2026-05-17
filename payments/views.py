@@ -13,7 +13,7 @@ from payments.utils import (
 )
 from orders.models import Order
 from tables.models import TableSession
-from accounts.permissions import IsAuthenticatedUserCustom, IsAdminUserCustom
+from accounts.permissions import IsAuthenticatedUserCustom, IsAdminUserCustom, get_target_admin
 
 
 def success_response(data=None, message="Success", http_status=200):
@@ -66,13 +66,32 @@ class PaymentPreviewView(APIView):
             user_points = order.user.loyalty_points
             customer_name = f"{order.user.first_name} {order.user.last_name}".strip()
 
+        try:
+            manual_discount = request.data.get("manual_discount")
+            if manual_discount is not None:
+                manual_discount = float(manual_discount)
+        except (TypeError, ValueError):
+            manual_discount = None
+
         err = validate_points_redemption(points_to_use, user_points, order.total_amount, config.point_value)
         if err:
             return error_response(err, "INVALID_REDEMPTION")
 
         discount = calculate_discount(points_to_use, config.point_value)
+        if manual_discount is not None:
+            discount = manual_discount
         cash_needed = round(order.total_amount - discount, 2)
         points_earned = calculate_points_earned(cash_needed, config.loyalty_percentage)
+
+        items = [
+            {
+                "name": oi.item.name,
+                "quantity": oi.quantity,
+                "price": oi.price,
+                "line_total": oi.quantity * oi.price
+            }
+            for oi in order.items.all()
+        ]
 
         return success_response({
             "order_number": order.order_number,
@@ -83,7 +102,8 @@ class PaymentPreviewView(APIView):
             "discount_amount": discount,
             "cash_payable": max(cash_needed, 0),
             "points_to_earn": points_earned,
-            "customer_name": customer_name
+            "customer_name": customer_name,
+            "items": items
         }, "Payment preview generated.")
 
 
@@ -101,10 +121,21 @@ class TableGroupPreviewView(APIView):
         from tables.models import Table
         from accounts.models import CustomUser
 
+        target_admin = get_target_admin(request)
         try:
-            table = Table.objects.get(table_number=table_number, admin=request.user)
+            table = Table.objects.get(table_number=table_number, admin=target_admin)
         except Table.DoesNotExist:
             return error_response("Table not found.", "TABLE_NOT_FOUND", 404)
+
+        # Get cafe and branch name
+        cafe_name = "Cafe"
+        branch_name = ""
+        try:
+            loc = table.admin.cafe_location
+            cafe_name = loc.cafe_name or "Cafe"
+            branch_name = loc.branch_name or ""
+        except Exception:
+            pass
 
         pending_orders = (
             Order.objects
@@ -168,6 +199,8 @@ class TableGroupPreviewView(APIView):
             "combined_items": list(combined_items.values()),
             "point_value": config.point_value,
             "loyalty_percentage": config.loyalty_percentage,
+            "cafe_name": cafe_name,
+            "branch_name": branch_name,
         })
 
 
@@ -203,6 +236,13 @@ class TableProcessPaymentView(APIView):
         except (TypeError, ValueError):
             points_used = 0.0
 
+        try:
+            manual_discount = request.data.get("manual_discount")
+            if manual_discount is not None:
+                manual_discount = float(manual_discount)
+        except (TypeError, ValueError):
+            manual_discount = None
+
         if not table_number and not order_number:
             return error_response("table_number or order_number is required.", "MISSING_FIELDS")
 
@@ -212,10 +252,12 @@ class TableProcessPaymentView(APIView):
         orders = None
         table = None
 
+        target_admin = get_target_admin(request)
+
         # ── Single order payment (legacy) ──
         if order_number and not per_user_phones:
             try:
-                order = Order.objects.get(order_number=order_number, payment_status='pending', admin=request.user)
+                order = Order.objects.get(order_number=order_number, payment_status='pending', admin=target_admin)
                 orders = [order]
                 table = order.table
                 table_number = table.table_number
@@ -224,7 +266,7 @@ class TableProcessPaymentView(APIView):
         else:
             # ── Table-wide payment ──
             try:
-                table = Table.objects.get(table_number=table_number, admin=request.user)
+                table = Table.objects.get(table_number=table_number, admin=target_admin)
             except Exception:
                 return error_response("Table not found.", "TABLE_NOT_FOUND", 404)
             orders = list(Order.objects.filter(table=table, payment_status='pending').exclude(status='cancelled'))
@@ -278,6 +320,9 @@ class TableProcessPaymentView(APIView):
                     single_user.loyalty_points = round(single_user.loyalty_points - points_used, 2)
                     single_user.save(update_fields=['loyalty_points'])
 
+                if manual_discount is not None:
+                    discount_amount = manual_discount
+
                 cash_needed = round(max(total_amount - discount_amount, 0), 2)
                 points_earned = 0.0
                 if single_user:
@@ -285,7 +330,7 @@ class TableProcessPaymentView(APIView):
                     single_user.loyalty_points = round(single_user.loyalty_points + points_earned, 2)
                     single_user.save(update_fields=['loyalty_points'])
 
-                payer = single_user or request.user
+                payer = single_user or target_admin
                 for order in orders:
                     if single_user and (not order.user or order.user.is_staff or order.user.phone_number == "0000000000"):
                         order.user = single_user
@@ -294,7 +339,7 @@ class TableProcessPaymentView(APIView):
                     order.save(update_fields=['payment_status', 'payment_method', 'user'])
 
                 payment = Payment.objects.create(
-                    admin=request.user,
+                    admin=target_admin,
                     table=table,
                     user=payer,
                     points_used=points_used,
@@ -348,6 +393,9 @@ class TableProcessPaymentView(APIView):
                     points_deducted_from = deduct_user
                 except CustomUser.DoesNotExist:
                     return error_response("Payer not found for points redemption.", "USER_NOT_FOUND", 404)
+            
+            if manual_discount is not None:
+                discount_amount = manual_discount
 
             cash_needed = round(max(total_amount - discount_amount, 0), 2)
             total_points_to_earn = calculate_points_earned(cash_needed, config.loyalty_percentage)
@@ -405,11 +453,11 @@ class TableProcessPaymentView(APIView):
             primary_user = (
                 points_deducted_from or
                 next((u for _, u in registered_orders if u is not None), None) or
-                request.user
+                target_admin
             )
 
             payment = Payment.objects.create(
-                admin=request.user,
+                admin=target_admin,
                 table=table,
                 user=primary_user,
                 points_used=points_used,
@@ -468,7 +516,7 @@ class PaymentHistoryView(APIView):
                     })
                 orders_data.append({
                     "order_number": order.order_number,
-                    "placed_by": order.user.get_full_name(),
+                    "placed_by": order.user.get_full_name() if order.user else "Walk-in Customer",
                     "placed_at": order.created_at.isoformat(),
                     "total_amount": order.total_amount,
                     "items": items_data
@@ -477,8 +525,8 @@ class PaymentHistoryView(APIView):
             data.append({
                 "table_number": p.table.table_number if p.table else "N/A",
                 "checkout_time": p.created_at.isoformat(),
-                "paid_by": p.user.get_full_name(),
-                "payer_phone": p.user.phone_number,
+                "paid_by": p.user.get_full_name() if p.user else "Walk-in Customer",
+                "payer_phone": p.user.phone_number if p.user else "N/A",
                 "total_amount": sum(o.total_amount for o in p.orders.all()),
                 "payment_method": p.orders.first().payment_method if p.orders.exists() else None,
                 "points_used": p.points_used,
@@ -500,9 +548,10 @@ class AdminGeneratePaymentQRView(APIView):
         if not table_number:
             return error_response("table_number is required.", "INVALID_INPUT")
 
+        target_admin = get_target_admin(request)
         try:
             from tables.models import Table
-            table = Table.objects.get(table_number=table_number)
+            table = Table.objects.get(table_number=table_number, admin=target_admin)
         except Exception:
             return error_response("Table not found.", "TABLE_NOT_FOUND", 404)
 

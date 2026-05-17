@@ -43,11 +43,9 @@ class Order(models.Model):
         ('pending', 'Pending'),
         ('completed', 'Completed'),
     ]
-    PAYMENT_METHOD_CHOICES = [
-        ('cash', 'Cash'),
-        ('online', 'Online'),
-        ('loyalty_points', 'Loyalty Points'),
-    ]
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='order_sent')
+    payment_status = models.CharField(max_length=20, choices=PAYMENT_STATUS_CHOICES, default='pending')
+    payment_method = models.CharField(max_length=50, null=True, blank=True)
 
     order_number = models.CharField(max_length=20, unique=True, editable=False)
     admin = models.ForeignKey(
@@ -59,9 +57,6 @@ class Order(models.Model):
     user = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='orders'
     )
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='order_sent')
-    payment_status = models.CharField(max_length=20, choices=PAYMENT_STATUS_CHOICES, default='pending')
-    payment_method = models.CharField(max_length=20, choices=PAYMENT_METHOD_CHOICES, null=True, blank=True)
     total_amount = models.FloatField(default=0.0)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

@@ -42,3 +42,16 @@ class PaymentRequest(models.Model):
 
     def __str__(self):
         return f"PaymentReq {self.id} | Order: {self.order.order_number} | Points: {self.points_required}"
+
+class CustomPaymentMethod(models.Model):
+    admin = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='custom_payment_methods')
+    name = models.CharField(max_length=50)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'custom_payment_methods'
+        unique_together = ('admin', 'name')
+
+    def __str__(self):
+        return f"{self.name} ({self.admin.phone_number})"
